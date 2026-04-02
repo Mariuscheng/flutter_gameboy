@@ -1,9 +1,12 @@
 use crate::gameboy::GameBoy;
 use crate::joypad::JoypadKey;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_channel::{Receiver, Sender, bounded};
 #[cfg(target_os = "android")]
 use std::panic::{self, AssertUnwindSafe};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 const EMULATOR_SAMPLE_RATE: u32 = 44_100;
 const EMULATOR_FRAME_RATE: f32 = 59.7275;
@@ -18,20 +21,77 @@ const AUDIO_BUFFER_MULTIPLIER: usize = 8;
 #[cfg(not(target_os = "android"))]
 const AUDIO_BUFFER_MULTIPLIER: usize = 4;
 
+#[cfg(target_os = "android")]
+const AUDIO_QUEUE_SECONDS: f32 = 0.35;
+#[cfg(not(target_os = "android"))]
+const AUDIO_QUEUE_SECONDS: f32 = 0.18;
+
 #[allow(missing_debug_implementations)]
 pub struct GameBoyEmulator {
     core: Box<GameBoy>,
     #[allow(dead_code)]
     audio_player: Option<AudioPlayer>,
-    audio_tx: Option<Sender<f32>>,
+    audio_buffer: Option<SharedAudioBufferHandle>,
+    last_input_revision: i32,
 }
 
 struct AudioPlayer {
     _stream: cpal::Stream,
 }
 
+type SharedAudioBufferHandle = Arc<Mutex<SharedAudioBuffer>>;
+
+struct SharedAudioBuffer {
+    samples: VecDeque<f32>,
+    max_samples: usize,
+}
+
+impl SharedAudioBuffer {
+    fn new(max_samples: usize) -> Self {
+        Self {
+            samples: VecDeque::with_capacity(max_samples),
+            max_samples,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn pop_front(&mut self) -> Option<f32> {
+        self.samples.pop_front()
+    }
+
+    fn push_samples(&mut self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+
+        if samples.len() >= self.max_samples {
+            self.samples.clear();
+            self.samples.extend(
+                samples[samples.len().saturating_sub(self.max_samples)..]
+                    .iter()
+                    .copied(),
+            );
+            return;
+        }
+
+        let overflow = self
+            .samples
+            .len()
+            .saturating_add(samples.len())
+            .saturating_sub(self.max_samples);
+        if overflow > 0 {
+            self.samples.drain(..overflow);
+        }
+
+        self.samples.extend(samples.iter().copied());
+    }
+}
+
 struct AudioOutputState {
-    rx: Receiver<f32>,
+    shared_buffer: SharedAudioBufferHandle,
     source_rate: u32,
     output_rate: u32,
     channels: usize,
@@ -43,9 +103,14 @@ struct AudioOutputState {
 }
 
 impl AudioOutputState {
-    fn new(rx: Receiver<f32>, source_rate: u32, output_rate: u32, channels: usize) -> Self {
+    fn new(
+        shared_buffer: SharedAudioBufferHandle,
+        source_rate: u32,
+        output_rate: u32,
+        channels: usize,
+    ) -> Self {
         Self {
-            rx,
+            shared_buffer,
             source_rate,
             output_rate,
             channels,
@@ -58,8 +123,10 @@ impl AudioOutputState {
     }
 
     fn fill_f32_buffer(&mut self, data: &mut [f32]) {
+        let shared_buffer_handle = Arc::clone(&self.shared_buffer);
+        let mut shared_buffer = shared_buffer_handle.lock().unwrap();
         for frame in data.chunks_mut(self.channels) {
-            let sample = self.next_output_sample();
+            let sample = self.next_output_sample(&mut shared_buffer);
             for channel in frame.iter_mut() {
                 *channel = sample;
             }
@@ -67,8 +134,10 @@ impl AudioOutputState {
     }
 
     fn fill_i16_buffer(&mut self, data: &mut [i16]) {
+        let shared_buffer_handle = Arc::clone(&self.shared_buffer);
+        let mut shared_buffer = shared_buffer_handle.lock().unwrap();
         for frame in data.chunks_mut(self.channels) {
-            let sample = (self.next_output_sample() * i16::MAX as f32) as i16;
+            let sample = (self.next_output_sample(&mut shared_buffer) * i16::MAX as f32) as i16;
             for channel in frame.iter_mut() {
                 *channel = sample;
             }
@@ -76,8 +145,10 @@ impl AudioOutputState {
     }
 
     fn fill_u16_buffer(&mut self, data: &mut [u16]) {
+        let shared_buffer_handle = Arc::clone(&self.shared_buffer);
+        let mut shared_buffer = shared_buffer_handle.lock().unwrap();
         for frame in data.chunks_mut(self.channels) {
-            let normalized = (self.next_output_sample() * 0.5) + 0.5;
+            let normalized = (self.next_output_sample(&mut shared_buffer) * 0.5) + 0.5;
             let sample = (normalized.clamp(0.0, 1.0) * u16::MAX as f32) as u16;
             for channel in frame.iter_mut() {
                 *channel = sample;
@@ -85,13 +156,13 @@ impl AudioOutputState {
         }
     }
 
-    fn next_output_sample(&mut self) -> f32 {
+    fn next_output_sample(&mut self, shared_buffer: &mut SharedAudioBuffer) -> f32 {
         if !self.primed {
-            if self.rx.len() < self.min_buffer_samples {
+            if shared_buffer.len() < self.min_buffer_samples {
                 return 0.0;
             }
-            self.current_sample = self.rx.try_recv().unwrap_or(0.0);
-            self.next_sample = self.rx.try_recv().unwrap_or(self.current_sample);
+            self.current_sample = shared_buffer.pop_front().unwrap_or(0.0);
+            self.next_sample = shared_buffer.pop_front().unwrap_or(self.current_sample);
             self.primed = true;
         }
 
@@ -103,7 +174,7 @@ impl AudioOutputState {
         while self.phase >= 1.0 {
             self.phase -= 1.0;
             self.current_sample = self.next_sample;
-            self.next_sample = self.rx.try_recv().unwrap_or(self.current_sample);
+            self.next_sample = shared_buffer.pop_front().unwrap_or(self.current_sample);
         }
 
         sample.clamp(-1.0, 1.0)
@@ -124,7 +195,8 @@ impl GameBoyEmulator {
         Ok(Self {
             core: gb,
             audio_player,
-            audio_tx,
+            audio_buffer: audio_tx,
+            last_input_revision: 0,
         })
     }
 
@@ -132,10 +204,12 @@ impl GameBoyEmulator {
         self.core.step_frame();
 
         // Output audio
-        if let Some(tx) = &self.audio_tx {
+        if let Some(buffer) = &self.audio_buffer {
             let samples = self.core.apu.drain_samples();
-            for s in samples {
-                let _ = tx.try_send(s);
+            if !samples.is_empty() {
+                if let Ok(mut shared_buffer) = buffer.lock() {
+                    shared_buffer.push_samples(&samples);
+                }
             }
         }
     }
@@ -166,10 +240,33 @@ impl GameBoyEmulator {
     pub fn release_button(&mut self, button: ButtonType) {
         self.core.joypad.set_key(button.into(), false);
     }
+
+    pub fn sync_buttons(&mut self, pressed_mask: u8, revision: i32) {
+        if revision < self.last_input_revision {
+            return;
+        }
+        self.last_input_revision = revision;
+
+        for button in [
+            ButtonType::A,
+            ButtonType::B,
+            ButtonType::Start,
+            ButtonType::Select,
+            ButtonType::Up,
+            ButtonType::Down,
+            ButtonType::Left,
+            ButtonType::Right,
+        ] {
+            let mask = button.mask();
+            self.core
+                .joypad
+                .set_key(button.into(), (pressed_mask & mask) != 0);
+        }
+    }
 }
 
 #[cfg(target_os = "android")]
-fn initialize_audio() -> (Option<AudioPlayer>, Option<Sender<f32>>) {
+fn initialize_audio() -> (Option<AudioPlayer>, Option<SharedAudioBufferHandle>) {
     match panic::catch_unwind(AssertUnwindSafe(initialize_audio_impl)) {
         Ok(result) => result,
         Err(_) => {
@@ -180,11 +277,11 @@ fn initialize_audio() -> (Option<AudioPlayer>, Option<Sender<f32>>) {
 }
 
 #[cfg(not(target_os = "android"))]
-fn initialize_audio() -> (Option<AudioPlayer>, Option<Sender<f32>>) {
+fn initialize_audio() -> (Option<AudioPlayer>, Option<SharedAudioBufferHandle>) {
     initialize_audio_impl()
 }
 
-fn initialize_audio_impl() -> (Option<AudioPlayer>, Option<Sender<f32>>) {
+fn initialize_audio_impl() -> (Option<AudioPlayer>, Option<SharedAudioBufferHandle>) {
     let host = cpal::default_host();
     let device = host.default_output_device();
 
@@ -192,7 +289,7 @@ fn initialize_audio_impl() -> (Option<AudioPlayer>, Option<Sender<f32>>) {
     println!("Default audio device is_some = {:?}", device.is_some());
 
     let mut audio_player = None;
-    let mut audio_tx = None;
+    let mut audio_buffer = None;
 
     if let Some(dev) = device {
         if let Ok(config) = dev.default_output_config() {
@@ -207,14 +304,20 @@ fn initialize_audio_impl() -> (Option<AudioPlayer>, Option<Sender<f32>>) {
             );
 
             let latency_frames = (sample_rate as f32 * AUDIO_LATENCY_SECONDS) as usize;
-            let (tx, rx) = bounded::<f32>(latency_frames * AUDIO_BUFFER_MULTIPLIER);
+            let max_samples = ((EMULATOR_SAMPLE_RATE as f32 * AUDIO_QUEUE_SECONDS) as usize)
+                .max(latency_frames * AUDIO_BUFFER_MULTIPLIER);
+            let shared_buffer = Arc::new(Mutex::new(SharedAudioBuffer::new(max_samples)));
 
             let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
 
             let stream_res = match sample_format {
                 cpal::SampleFormat::F32 => {
-                    let mut output =
-                        AudioOutputState::new(rx, EMULATOR_SAMPLE_RATE, sample_rate, channels);
+                    let mut output = AudioOutputState::new(
+                        Arc::clone(&shared_buffer),
+                        EMULATOR_SAMPLE_RATE,
+                        sample_rate,
+                        channels,
+                    );
                     dev.build_output_stream(
                         &stream_config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -225,8 +328,12 @@ fn initialize_audio_impl() -> (Option<AudioPlayer>, Option<Sender<f32>>) {
                     )
                 }
                 cpal::SampleFormat::I16 => {
-                    let mut output =
-                        AudioOutputState::new(rx, EMULATOR_SAMPLE_RATE, sample_rate, channels);
+                    let mut output = AudioOutputState::new(
+                        Arc::clone(&shared_buffer),
+                        EMULATOR_SAMPLE_RATE,
+                        sample_rate,
+                        channels,
+                    );
                     dev.build_output_stream(
                         &stream_config,
                         move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
@@ -237,8 +344,12 @@ fn initialize_audio_impl() -> (Option<AudioPlayer>, Option<Sender<f32>>) {
                     )
                 }
                 cpal::SampleFormat::U16 => {
-                    let mut output =
-                        AudioOutputState::new(rx, EMULATOR_SAMPLE_RATE, sample_rate, channels);
+                    let mut output = AudioOutputState::new(
+                        Arc::clone(&shared_buffer),
+                        EMULATOR_SAMPLE_RATE,
+                        sample_rate,
+                        channels,
+                    );
                     dev.build_output_stream(
                         &stream_config,
                         move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
@@ -256,7 +367,7 @@ fn initialize_audio_impl() -> (Option<AudioPlayer>, Option<Sender<f32>>) {
                     println!("Audio stream built successfully, starting playback");
                     s.play().ok();
                     audio_player = Some(AudioPlayer { _stream: s });
-                    audio_tx = Some(tx);
+                    audio_buffer = Some(shared_buffer);
                 }
                 Err(e) => {
                     println!("Failed to build output stream: {:?}", e);
@@ -269,10 +380,11 @@ fn initialize_audio_impl() -> (Option<AudioPlayer>, Option<Sender<f32>>) {
         println!("No audio output device found.");
     }
 
-    (audio_player, audio_tx)
+    (audio_player, audio_buffer)
 }
 
 #[allow(missing_debug_implementations)]
+#[derive(Clone, Copy)]
 pub enum ButtonType {
     A,
     B,
@@ -282,6 +394,21 @@ pub enum ButtonType {
     Down,
     Left,
     Right,
+}
+
+impl ButtonType {
+    fn mask(self) -> u8 {
+        match self {
+            ButtonType::A => 1 << 0,
+            ButtonType::B => 1 << 1,
+            ButtonType::Start => 1 << 2,
+            ButtonType::Select => 1 << 3,
+            ButtonType::Up => 1 << 4,
+            ButtonType::Down => 1 << 5,
+            ButtonType::Left => 1 << 6,
+            ButtonType::Right => 1 << 7,
+        }
+    }
 }
 
 impl From<ButtonType> for JoypadKey {
@@ -301,16 +428,19 @@ impl From<ButtonType> for JoypadKey {
 
 #[cfg(test)]
 mod tests {
-    use super::AudioOutputState;
-    use crossbeam_channel::bounded;
+    use super::{AudioOutputState, SharedAudioBuffer, SharedAudioBufferHandle};
+    use std::sync::{Arc, Mutex};
+
+    fn shared_buffer_with_samples(samples: &[f32], max_samples: usize) -> SharedAudioBufferHandle {
+        let buffer = Arc::new(Mutex::new(SharedAudioBuffer::new(max_samples)));
+        buffer.lock().unwrap().push_samples(samples);
+        buffer
+    }
 
     #[test]
     fn duplicates_mono_sample_to_all_output_channels() {
-        let (tx, rx) = bounded(8);
-        tx.send(0.25).unwrap();
-        tx.send(-0.5).unwrap();
-
-        let mut output = AudioOutputState::new(rx, 44_100, 44_100, 2);
+        let shared_buffer = shared_buffer_with_samples(&[0.25, -0.5], 8);
+        let mut output = AudioOutputState::new(shared_buffer, 44_100, 44_100, 2);
         output.min_buffer_samples = 0;
         let mut buffer = [0.0; 4];
         output.fill_f32_buffer(&mut buffer);
@@ -320,12 +450,8 @@ mod tests {
 
     #[test]
     fn resamples_mono_source_to_higher_output_rate() {
-        let (tx, rx) = bounded(8);
-        tx.send(-1.0).unwrap();
-        tx.send(1.0).unwrap();
-        tx.send(-1.0).unwrap();
-
-        let mut output = AudioOutputState::new(rx, 44_100, 48_000, 1);
+        let shared_buffer = shared_buffer_with_samples(&[-1.0, 1.0, -1.0], 8);
+        let mut output = AudioOutputState::new(shared_buffer, 44_100, 48_000, 1);
         output.min_buffer_samples = 0;
         let mut buffer = [0.0; 4];
         output.fill_f32_buffer(&mut buffer);
@@ -339,12 +465,9 @@ mod tests {
 
     #[test]
     fn holds_last_sample_when_source_buffer_runs_dry() {
-        let (tx, rx) = bounded(4096);
-        for _ in 0..2000 {
-            tx.send(0.75).unwrap();
-        }
-
-        let mut output = AudioOutputState::new(rx, 44_100, 48_000, 1);
+        let samples = vec![0.75; 2000];
+        let shared_buffer = shared_buffer_with_samples(&samples, 4096);
+        let mut output = AudioOutputState::new(shared_buffer, 44_100, 48_000, 1);
         output.min_buffer_samples = 0;
         let mut buffer = [0.0; 2500];
         output.fill_f32_buffer(&mut buffer);

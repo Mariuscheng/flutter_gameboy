@@ -20,6 +20,8 @@ abstract class GameBoyEmulator implements RustOpaqueInterface {
 
   Future<void> releaseButton({required ButtonType button});
 
+  Future<void> syncButtons({required int pressedMask, required int revision});
+
   Future<void> stepFrame();
 }
 

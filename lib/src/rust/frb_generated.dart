@@ -94,6 +94,12 @@ abstract class RustLibApi extends BaseApi {
     required ButtonType button,
   });
 
+  Future<void> crateApiGameBoyEmulatorSyncButtons({
+    required GameBoyEmulator that,
+    required int pressedMask,
+    required int revision,
+  });
+
   Future<void> crateApiGameBoyEmulatorStepFrame({
     required GameBoyEmulator that,
   });
@@ -295,6 +301,46 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(
         debugName: "GameBoyEmulator_step_frame",
         argNames: ["that"],
+      );
+
+  @override
+  Future<void> crateApiGameBoyEmulatorSyncButtons({
+    required GameBoyEmulator that,
+    required int pressedMask,
+    required int revision,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerGameBoyEmulator(
+            that,
+            serializer,
+          );
+          sse_encode_u_8(pressedMask, serializer);
+          sse_encode_i_32(revision, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 6,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiGameBoyEmulatorSyncButtonsConstMeta,
+        argValues: [that, pressedMask, revision],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiGameBoyEmulatorSyncButtonsConstMeta =>
+      const TaskConstMeta(
+        debugName: "GameBoyEmulator_sync_buttons",
+        argNames: ["that", "pressedMask", "revision"],
       );
 
   RustArcIncrementStrongCountFnType
@@ -639,6 +685,13 @@ class GameBoyEmulatorImpl extends RustOpaque implements GameBoyEmulator {
       .instance
       .api
       .crateApiGameBoyEmulatorReleaseButton(that: this, button: button);
+
+  Future<void> syncButtons({required int pressedMask, required int revision}) =>
+      RustLib.instance.api.crateApiGameBoyEmulatorSyncButtons(
+        that: this,
+        pressedMask: pressedMask,
+        revision: revision,
+      );
 
   Future<void> stepFrame() =>
       RustLib.instance.api.crateApiGameBoyEmulatorStepFrame(that: this);

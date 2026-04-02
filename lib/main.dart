@@ -1,8 +1,8 @@
 import 'dart:async';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 
@@ -50,6 +50,7 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
   static const _screenHeight = 144;
   static const _emulatorFrameMicros = 16743;
   static const _maxCatchUpFrames = 4;
+  static const _mobileDisplayFrameMicros = 33333;
 
   GameBoyEmulator? _emulator;
   Ticker? _ticker;
@@ -58,7 +59,21 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
   bool _isRendering = false;
   Duration? _lastTick;
   int _pendingFrameMicros = 0;
+  int _pendingDisplayMicros = 0;
+  final Set<ButtonType> _pressedButtons = <ButtonType>{};
+  final Set<ButtonType> _dpadButtons = <ButtonType>{};
+  int _inputRevision = 0;
   String? _status;
+
+  int get _targetDisplayMicros {
+    if (kIsWeb) {
+      return _emulatorFrameMicros;
+    }
+    return switch (defaultTargetPlatform) {
+      TargetPlatform.android || TargetPlatform.iOS => _mobileDisplayFrameMicros,
+      _ => _emulatorFrameMicros,
+    };
+  }
 
   @override
   void dispose() {
@@ -103,6 +118,9 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
       _frameImageNotifier.value = null;
       _lastTick = null;
       _pendingFrameMicros = _emulatorFrameMicros;
+      _pendingDisplayMicros = _targetDisplayMicros;
+      _pressedButtons.clear();
+      _inputRevision = 0;
 
       final emulator = await GameBoyEmulator.newInstance(romBytes: bytes);
       _emulator = emulator;
@@ -152,12 +170,22 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
           framesStepped < _maxCatchUpFrames) {
         await emulator.stepFrame();
         _pendingFrameMicros -= _emulatorFrameMicros;
+        _pendingDisplayMicros += _emulatorFrameMicros;
         framesStepped += 1;
       }
 
       if (framesStepped == 0) {
         return;
       }
+
+      final shouldRefreshImage =
+          _frameImageNotifier.value == null ||
+          _pendingDisplayMicros >= _targetDisplayMicros;
+      if (!shouldRefreshImage) {
+        return;
+      }
+
+      _pendingDisplayMicros %= _targetDisplayMicros;
 
       final bytes = await emulator.getFrameBuffer();
       if (bytes.length < _screenWidth * _screenHeight * 4) {
@@ -201,17 +229,67 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
     return completer.future;
   }
 
-  Future<void> _setButton(ButtonType button, bool pressed) async {
+  void _setButton(ButtonType button, bool pressed) {
     final emulator = _emulator;
     if (emulator == null) {
       return;
     }
 
     if (pressed) {
-      await emulator.pressButton(button: button);
+      if (!_pressedButtons.add(button)) {
+        return;
+      }
     } else {
-      await emulator.releaseButton(button: button);
+      if (!_pressedButtons.remove(button)) {
+        return;
+      }
     }
+
+    _inputRevision += 1;
+    unawaited(
+      emulator.syncButtons(
+        pressedMask: _buildPressedMask(),
+        revision: _inputRevision,
+      ),
+    );
+  }
+
+  void _setDPadButtons(Set<ButtonType> buttons) {
+    final emulator = _emulator;
+    if (emulator == null || setEquals(buttons, _dpadButtons)) {
+      return;
+    }
+
+    _pressedButtons.removeAll(_dpadButtons);
+    _dpadButtons
+      ..clear()
+      ..addAll(buttons);
+    _pressedButtons.addAll(_dpadButtons);
+
+    _inputRevision += 1;
+    unawaited(
+      emulator.syncButtons(
+        pressedMask: _buildPressedMask(),
+        revision: _inputRevision,
+      ),
+    );
+  }
+
+  int _buildPressedMask() {
+    var mask = 0;
+    for (final button in _pressedButtons) {
+      mask |= switch (button) {
+        ButtonType.a => 1 << 0,
+        ButtonType.b => 1 << 1,
+        ButtonType.start => 1 << 2,
+        ButtonType.select => 1 << 3,
+        ButtonType.up => 1 << 4,
+        ButtonType.down => 1 << 5,
+        ButtonType.left => 1 << 6,
+        ButtonType.right => 1 << 7,
+      };
+    }
+    return mask;
   }
 
   @override
@@ -221,6 +299,7 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
         child: LayoutBuilder(
           builder: (context, constraints) {
             return SingleChildScrollView(
+              physics: const NeverScrollableScrollPhysics(),
               padding: const EdgeInsets.all(20),
               child: ConstrainedBox(
                 constraints: BoxConstraints(minHeight: constraints.maxHeight),
@@ -315,78 +394,7 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
   }
 
   Widget _buildDPad() {
-    return SizedBox(
-      width: 150,
-      height: 150,
-      child: Stack(
-        alignment: Alignment.center,
-        children: [
-          // Background vertical structure
-          Positioned(
-            child: Container(
-              width: 50,
-              height: 150,
-              decoration: BoxDecoration(
-                color: const Color(0xFF2E3D31),
-                borderRadius: BorderRadius.circular(8),
-              ),
-            ),
-          ),
-          // Background horizontal structure
-          Positioned(
-            child: Container(
-              width: 150,
-              height: 50,
-              decoration: BoxDecoration(
-                color: const Color(0xFF2E3D31),
-                borderRadius: BorderRadius.circular(8),
-              ),
-            ),
-          ),
-          // Buttons
-          Positioned(
-            top: 0,
-            child: _DPadDirection(
-              icon: Icons.arrow_drop_up,
-              onChanged: (pressed) => _setButton(ButtonType.up, pressed),
-            ),
-          ),
-          Positioned(
-            bottom: 0,
-            child: _DPadDirection(
-              icon: Icons.arrow_drop_down,
-              onChanged: (pressed) => _setButton(ButtonType.down, pressed),
-            ),
-          ),
-          Positioned(
-            left: 0,
-            child: _DPadDirection(
-              icon: Icons.arrow_left,
-              onChanged: (pressed) => _setButton(ButtonType.left, pressed),
-            ),
-          ),
-          Positioned(
-            right: 0,
-            child: _DPadDirection(
-              icon: Icons.arrow_right,
-              onChanged: (pressed) => _setButton(ButtonType.right, pressed),
-            ),
-          ),
-          // Center circle design element
-          Positioned(
-            child: Container(
-              width: 30,
-              height: 30,
-              decoration: BoxDecoration(
-                color: const Color(0xFF2E3D31),
-                shape: BoxShape.circle,
-                border: Border.all(color: const Color(0xFF1D2A1F), width: 2),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
+    return _DPadControl(onChanged: _setDPadButtons);
   }
 
   Widget _buildActionButtons() {
@@ -434,24 +442,138 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
   }
 }
 
-class _DPadDirection extends StatelessWidget {
-  const _DPadDirection({required this.icon, required this.onChanged});
+class _DPadControl extends StatefulWidget {
+  const _DPadControl({required this.onChanged});
 
-  final IconData icon;
-  final ValueChanged<bool> onChanged;
+  final ValueChanged<Set<ButtonType>> onChanged;
+
+  @override
+  State<_DPadControl> createState() => _DPadControlState();
+}
+
+class _DPadControlState extends State<_DPadControl> {
+  static const _size = 150.0;
+  static const _deadZone = 18.0;
+  static const _axisThreshold = 24.0;
+
+  final Map<int, Set<ButtonType>> _pointerDirections = <int, Set<ButtonType>>{};
+
+  void _updatePointer(int pointer, Offset position) {
+    _pointerDirections[pointer] = _directionsForPosition(position);
+    _notify();
+  }
+
+  void _removePointer(int pointer) {
+    if (_pointerDirections.remove(pointer) != null) {
+      _notify();
+    }
+  }
+
+  void _notify() {
+    final active = <ButtonType>{};
+    for (final directions in _pointerDirections.values) {
+      active.addAll(directions);
+    }
+    widget.onChanged(active);
+  }
+
+  Set<ButtonType> _directionsForPosition(Offset position) {
+    final dx = position.dx - (_size / 2);
+    final dy = position.dy - (_size / 2);
+
+    if (dx.abs() < _deadZone && dy.abs() < _deadZone) {
+      return <ButtonType>{};
+    }
+
+    final result = <ButtonType>{};
+    if (dx <= -_axisThreshold) {
+      result.add(ButtonType.left);
+    } else if (dx >= _axisThreshold) {
+      result.add(ButtonType.right);
+    }
+
+    if (dy <= -_axisThreshold) {
+      result.add(ButtonType.up);
+    } else if (dy >= _axisThreshold) {
+      result.add(ButtonType.down);
+    }
+
+    if (result.isEmpty) {
+      if (dx.abs() >= dy.abs()) {
+        result.add(dx < 0 ? ButtonType.left : ButtonType.right);
+      } else {
+        result.add(dy < 0 ? ButtonType.up : ButtonType.down);
+      }
+    }
+
+    return result;
+  }
 
   @override
   Widget build(BuildContext context) {
     return Listener(
-      onPointerDown: (_) => onChanged(true),
-      onPointerUp: (_) => onChanged(false),
-      onPointerCancel: (_) => onChanged(false),
-      child: Container(
-        width: 50,
-        height: 50,
-        color: Colors.transparent, // Invisible click area
-        alignment: Alignment.center,
-        child: Icon(icon, color: Colors.white, size: 40),
+      behavior: HitTestBehavior.opaque,
+      onPointerDown: (event) =>
+          _updatePointer(event.pointer, event.localPosition),
+      onPointerMove: (event) =>
+          _updatePointer(event.pointer, event.localPosition),
+      onPointerUp: (event) => _removePointer(event.pointer),
+      onPointerCancel: (event) => _removePointer(event.pointer),
+      child: SizedBox(
+        width: _size,
+        height: _size,
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            Positioned(
+              child: Container(
+                width: 50,
+                height: _size,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF2E3D31),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+            ),
+            Positioned(
+              child: Container(
+                width: _size,
+                height: 50,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF2E3D31),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+            ),
+            const Positioned(
+              top: 0,
+              child: Icon(Icons.arrow_drop_up, color: Colors.white, size: 40),
+            ),
+            const Positioned(
+              bottom: 0,
+              child: Icon(Icons.arrow_drop_down, color: Colors.white, size: 40),
+            ),
+            const Positioned(
+              left: 0,
+              child: Icon(Icons.arrow_left, color: Colors.white, size: 40),
+            ),
+            const Positioned(
+              right: 0,
+              child: Icon(Icons.arrow_right, color: Colors.white, size: 40),
+            ),
+            Positioned(
+              child: Container(
+                width: 30,
+                height: 30,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF2E3D31),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: const Color(0xFF1D2A1F), width: 2),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -465,10 +587,8 @@ class _RoundButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Listener(
-      onPointerDown: (_) => onChanged(true),
-      onPointerUp: (_) => onChanged(false),
-      onPointerCancel: (_) => onChanged(false),
+    return _MultiTouchButton(
+      onChanged: onChanged,
       child: Container(
         width: 64,
         height: 64,
@@ -501,10 +621,8 @@ class _PillButton extends StatelessWidget {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Listener(
-          onPointerDown: (_) => onChanged(true),
-          onPointerUp: (_) => onChanged(false),
-          onPointerCancel: (_) => onChanged(false),
+        _MultiTouchButton(
+          onChanged: onChanged,
           child: Transform.rotate(
             angle: -0.4,
             child: Container(
@@ -528,6 +646,46 @@ class _PillButton extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+class _MultiTouchButton extends StatefulWidget {
+  const _MultiTouchButton({required this.child, required this.onChanged});
+
+  final Widget child;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  State<_MultiTouchButton> createState() => _MultiTouchButtonState();
+}
+
+class _MultiTouchButtonState extends State<_MultiTouchButton> {
+  final Set<int> _activePointers = <int>{};
+
+  void _press(int pointer) {
+    final wasEmpty = _activePointers.isEmpty;
+    _activePointers.add(pointer);
+    if (wasEmpty) {
+      widget.onChanged(true);
+    }
+  }
+
+  void _release(int pointer) {
+    final removed = _activePointers.remove(pointer);
+    if (removed && _activePointers.isEmpty) {
+      widget.onChanged(false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Listener(
+      behavior: HitTestBehavior.opaque,
+      onPointerDown: (event) => _press(event.pointer),
+      onPointerUp: (event) => _release(event.pointer),
+      onPointerCancel: (event) => _release(event.pointer),
+      child: widget.child,
     );
   }
 }
