@@ -21,8 +21,6 @@ pub struct Joypad {
 
 #[derive(Debug, Clone)]
 pub struct KeyState {
-    #[allow(dead_code)]
-    pub key: JoypadKey,
     pub pressed: bool,
     pub last_change: Instant,
     pub press_duration: Duration,
@@ -33,7 +31,6 @@ pub struct KeyState {
 impl Default for KeyState {
     fn default() -> Self {
         Self {
-            key: JoypadKey::A,
             pressed: false,
             last_change: Instant::now(),
             press_duration: Duration::ZERO,
@@ -61,38 +58,14 @@ impl Default for DebounceFilter {
 impl Joypad {
     pub fn new() -> Self {
         let mut key_states = [
-            KeyState {
-                key: JoypadKey::A,
-                ..Default::default()
-            },
-            KeyState {
-                key: JoypadKey::B,
-                ..Default::default()
-            },
-            KeyState {
-                key: JoypadKey::Select,
-                ..Default::default()
-            },
-            KeyState {
-                key: JoypadKey::Start,
-                ..Default::default()
-            },
-            KeyState {
-                key: JoypadKey::Right,
-                ..Default::default()
-            },
-            KeyState {
-                key: JoypadKey::Left,
-                ..Default::default()
-            },
-            KeyState {
-                key: JoypadKey::Up,
-                ..Default::default()
-            },
-            KeyState {
-                key: JoypadKey::Down,
-                ..Default::default()
-            },
+            KeyState::default(),
+            KeyState::default(),
+            KeyState::default(),
+            KeyState::default(),
+            KeyState::default(),
+            KeyState::default(),
+            KeyState::default(),
+            KeyState::default(),
         ];
 
         // 初始化所有按鍵為放開狀態
@@ -146,8 +119,19 @@ impl Joypad {
     }
 
     pub fn write_register(&mut self, value: u8) {
+        let old_res = self.read_register();
+
         // 只允許寫入位元 4 和 5
         self.select = value & 0x30;
+
+        let new_res = self.read_register();
+        let should_trigger_interrupt = (old_res & !new_res & 0x0F) != 0;
+        if should_trigger_interrupt && let Some(handler_ptr) = self.interrupt_handler {
+            unsafe {
+                use crate::gameboy::InterruptType;
+                (*handler_ptr).trigger_interrupt(InterruptType::Joypad);
+            }
+        }
     }
 
     // 更新按鍵狀態 (由外部轉送，如 SDL3)
@@ -155,7 +139,6 @@ impl Joypad {
     pub fn set_key(&mut self, key: JoypadKey, pressed: bool) -> bool {
         let key_index = key.as_index();
 
-        let old_res = self.read_register();
         let key_state = &mut self.key_states[key_index];
 
         // 更新狀態追蹤
@@ -177,10 +160,9 @@ impl Joypad {
             JoypadKey::Down => Self::update_key_bit(&mut self.direction_keys, 0x08, pressed),
         }
 
-        let new_res = self.read_register();
-
-        // 如果任何位元從 1 變為 0 (Falling Edge)，觸發 Joypad 中斷
-        let should_trigger_interrupt = (old_res & !new_res & 0x0F) != 0;
+        // 真機上 Joypad interrupt 會在「新按下」時喚醒 CPU，
+        // 不應該依賴當下 select row，否則 select=0x30 時無法被按鍵喚醒。
+        let should_trigger_interrupt = pressed && !previous_pressed;
         if should_trigger_interrupt && let Some(handler_ptr) = self.interrupt_handler {
             unsafe {
                 use crate::gameboy::InterruptType;
@@ -189,6 +171,54 @@ impl Joypad {
         }
 
         should_trigger_interrupt
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Joypad, JoypadKey};
+    use crate::gameboy::InterruptHandler;
+
+    #[test]
+    fn pressing_selected_key_requests_joypad_interrupt_immediately() {
+        let mut joypad = Joypad::new();
+        let mut interrupt_handler = InterruptHandler::new();
+        joypad.set_interrupt_handler(&mut interrupt_handler as *mut InterruptHandler);
+
+        joypad.write_register(0x20);
+        joypad.set_key(JoypadKey::Right, true);
+
+        assert_eq!(interrupt_handler.if_register & 0x10, 0x10);
+    }
+
+    #[test]
+    fn selecting_pressed_key_row_requests_joypad_interrupt() {
+        let mut joypad = Joypad::new();
+        let mut interrupt_handler = InterruptHandler::new();
+        joypad.set_interrupt_handler(&mut interrupt_handler as *mut InterruptHandler);
+
+        joypad.set_key(JoypadKey::Start, true);
+        assert_eq!(interrupt_handler.if_register & 0x10, 0x10);
+
+        interrupt_handler.if_register = 0xE0;
+
+        joypad.write_register(0x10);
+
+        assert_eq!(interrupt_handler.if_register & 0x10, 0x10);
+    }
+
+    #[test]
+    fn pressing_key_without_selected_row_still_requests_joypad_interrupt() {
+        let mut joypad = Joypad::new();
+        let mut interrupt_handler = InterruptHandler::new();
+        joypad.set_interrupt_handler(&mut interrupt_handler as *mut InterruptHandler);
+
+        assert_eq!(joypad.read_register(), 0xFF);
+
+        joypad.set_key(JoypadKey::Down, true);
+
+        assert_eq!(interrupt_handler.if_register & 0x10, 0x10);
+        assert_eq!(joypad.read_register(), 0xFF);
     }
 }
 

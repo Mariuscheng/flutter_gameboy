@@ -69,7 +69,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
         stem: 'rust_lib_flutter_gameboy',
-        ioDirectory: 'rust/target/release/',
+        ioDirectory: null,
         webPrefix: 'pkg/',
         wasmBindgenName: 'wasm_bindgen',
       );
@@ -82,6 +82,10 @@ abstract class RustLibApi extends BaseApi {
 
   Future<GameBoyEmulator> crateApiGameBoyEmulatorNew({
     required List<int> romBytes,
+  });
+
+  Future<GameBoyEmulator> crateApiGameBoyEmulatorNewFromPath({
+    required String path,
   });
 
   Future<void> crateApiGameBoyEmulatorPressButton({
@@ -190,6 +194,40 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     debugName: "GameBoyEmulator_new",
     argNames: ["romBytes"],
   );
+
+  @override
+  Future<GameBoyEmulator> crateApiGameBoyEmulatorNewFromPath({
+    required String path,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(path, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 7,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData:
+              sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerGameBoyEmulator,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiGameBoyEmulatorNewFromPathConstMeta,
+        argValues: [path],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiGameBoyEmulatorNewFromPathConstMeta =>
+      const TaskConstMeta(
+        debugName: "GameBoyEmulator_new_from_path",
+        argNames: ["path"],
+      );
 
   @override
   Future<void> crateApiGameBoyEmulatorPressButton({

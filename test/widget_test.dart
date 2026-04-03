@@ -8,6 +8,6 @@ void main() {
 
     expect(find.text('Flutter GameBoy'), findsOneWidget);
     expect(find.text('選擇 ROM'), findsOneWidget);
-    expect(find.text('請先載入 .gb 或 .gbc ROM'), findsOneWidget);
+    expect(find.text('請先載入 .gb ROM'), findsOneWidget);
   });
 }

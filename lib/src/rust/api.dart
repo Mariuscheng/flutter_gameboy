@@ -16,6 +16,9 @@ abstract class GameBoyEmulator implements RustOpaqueInterface {
   static Future<GameBoyEmulator> newInstance({required List<int> romBytes}) =>
       RustLib.instance.api.crateApiGameBoyEmulatorNew(romBytes: romBytes);
 
+  static Future<GameBoyEmulator> newFromPath({required String path}) =>
+      RustLib.instance.api.crateApiGameBoyEmulatorNewFromPath(path: path);
+
   Future<void> pressButton({required ButtonType button});
 
   Future<void> releaseButton({required ButtonType button});

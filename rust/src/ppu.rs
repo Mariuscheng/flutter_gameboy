@@ -566,10 +566,4 @@ impl Ppu {
             self.window_line_counter += 1;
         }
     }
-
-    // 獲取畫面緩衝區的引用
-    #[allow(dead_code)]
-    pub fn get_framebuffer(&self) -> &[u8] {
-        &self.framebuffer
-    }
 }

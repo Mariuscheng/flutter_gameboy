@@ -5,7 +5,9 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart';
 
+import 'src/input_mask.dart';
 import 'src/rust/api.dart';
 import 'src/rust/frb_generated.dart';
 
@@ -45,7 +47,7 @@ class GameBoyHomePage extends StatefulWidget {
 }
 
 class _GameBoyHomePageState extends State<GameBoyHomePage>
-    with SingleTickerProviderStateMixin {
+    with TickerProviderStateMixin {
   static const _screenWidth = 160;
   static const _screenHeight = 144;
   static const _emulatorFrameMicros = 16743;
@@ -54,16 +56,46 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
 
   GameBoyEmulator? _emulator;
   Ticker? _ticker;
+  final FocusNode _focusNode = FocusNode(debugLabel: 'gameboy-input');
   final ValueNotifier<ui.Image?> _frameImageNotifier = ValueNotifier(null);
+  final ScrollController _scrollController = ScrollController();
   bool _loadingRom = false;
   bool _isRendering = false;
   Duration? _lastTick;
   int _pendingFrameMicros = 0;
   int _pendingDisplayMicros = 0;
-  final Set<ButtonType> _pressedButtons = <ButtonType>{};
+  final Set<ButtonType> _touchButtons = <ButtonType>{};
   final Set<ButtonType> _dpadButtons = <ButtonType>{};
+  final Set<ButtonType> _keyboardButtons = <ButtonType>{};
   int _inputRevision = 0;
+  int _lastSyncedMask = -1;
+  bool _inputDirty = true;
+  int _emulatorSession = 0;
   String? _status;
+
+  bool get _shouldReadRomBytes {
+    if (kIsWeb) {
+      return true;
+    }
+
+    return switch (defaultTargetPlatform) {
+      TargetPlatform.android || TargetPlatform.iOS => true,
+      _ => false,
+    };
+  }
+
+  bool get _shouldEnableScroll {
+    if (kIsWeb) {
+      return true;
+    }
+
+    return switch (defaultTargetPlatform) {
+      TargetPlatform.windows ||
+      TargetPlatform.linux ||
+      TargetPlatform.macOS => true,
+      _ => false,
+    };
+  }
 
   int get _targetDisplayMicros {
     if (kIsWeb) {
@@ -78,12 +110,28 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
   @override
   void dispose() {
     _ticker?.dispose();
+    _focusNode.dispose();
+    _scrollController.dispose();
     _frameImageNotifier.value?.dispose();
     _frameImageNotifier.dispose();
     super.dispose();
   }
 
+  void _requestInputFocus() {
+    if (!mounted) {
+      return;
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _focusNode.requestFocus();
+      }
+    });
+  }
+
   Future<void> _pickRomAndStart() async {
+    final session = ++_emulatorSession;
+
     setState(() {
       _loadingRom = true;
       _status = null;
@@ -91,7 +139,7 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
 
     try {
       final result = await FilePicker.platform.pickFiles(
-        withData: true,
+        withData: _shouldReadRomBytes,
         type: FileType.custom,
         allowedExtensions: const ['gb', 'gbc'],
       );
@@ -101,30 +149,64 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
           _loadingRom = false;
           _status = '未選擇 ROM。';
         });
+        _requestInputFocus();
         return;
       }
 
-      final bytes = result.files.single.bytes;
-      if (bytes == null || bytes.isEmpty) {
+      final selectedFile = result.files.single;
+      final bytes = selectedFile.bytes;
+      final path = selectedFile.path;
+
+      if (_shouldReadRomBytes) {
+        if (bytes == null || bytes.isEmpty) {
+          setState(() {
+            _loadingRom = false;
+            _status = 'ROM 內容為空，請重新選擇檔案。';
+          });
+          _requestInputFocus();
+          return;
+        }
+      } else if (path == null || path.isEmpty) {
         setState(() {
           _loadingRom = false;
-          _status = 'ROM 內容為空，請重新選擇檔案。';
+          _status = '找不到 ROM 檔案路徑，請重新選擇檔案。';
         });
+        _requestInputFocus();
         return;
       }
 
+      _emulator = null;
       _ticker?.dispose();
+      _ticker = null;
       _frameImageNotifier.value?.dispose();
       _frameImageNotifier.value = null;
       _lastTick = null;
+      _isRendering = false;
       _pendingFrameMicros = _emulatorFrameMicros;
       _pendingDisplayMicros = _targetDisplayMicros;
-      _pressedButtons.clear();
+      _touchButtons.clear();
+      _dpadButtons.clear();
+      _keyboardButtons.clear();
       _inputRevision = 0;
+      _lastSyncedMask = -1;
+      _inputDirty = true;
 
-      final emulator = await GameBoyEmulator.newInstance(romBytes: bytes);
+      final emulator = _shouldReadRomBytes
+          ? await GameBoyEmulator.newInstance(romBytes: bytes!)
+          : await RustLib.instance.api.crateApiGameBoyEmulatorNewFromPath(
+              path: path!,
+            );
+
+      if (!mounted || session != _emulatorSession) {
+        return;
+      }
+
       _emulator = emulator;
       _ticker = createTicker((elapsed) {
+        if (session != _emulatorSession) {
+          return;
+        }
+
         if (_lastTick == null) {
           _lastTick = elapsed;
           return;
@@ -140,26 +222,32 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
           0,
           _emulatorFrameMicros * _maxCatchUpFrames,
         );
-        unawaited(_renderNextFrame());
+        unawaited(_renderNextFrame(session));
       })..start();
 
       setState(() {
         _loadingRom = false;
-        _status = 'ROM 已載入：${result.files.single.name}';
+        _status = 'ROM 已載入：${selectedFile.name}';
       });
+      _requestInputFocus();
     } catch (error) {
       setState(() {
         _loadingRom = false;
         _status = '載入失敗：$error';
       });
+      _requestInputFocus();
     }
   }
 
-  Future<void> _renderNextFrame() async {
+  Future<void> _renderNextFrame(int session) async {
     if (_isRendering) return;
     _isRendering = true;
 
     try {
+      if (session != _emulatorSession) {
+        return;
+      }
+
       final emulator = _emulator;
       if (emulator == null || !mounted) {
         return;
@@ -168,6 +256,17 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
       var framesStepped = 0;
       while (_pendingFrameMicros >= _emulatorFrameMicros &&
           framesStepped < _maxCatchUpFrames) {
+        final pressedMask = _currentPressedMask();
+        if (_inputDirty || pressedMask != _lastSyncedMask) {
+          _inputRevision += 1;
+          await emulator.syncButtons(
+            pressedMask: pressedMask,
+            revision: _inputRevision,
+          );
+          _lastSyncedMask = pressedMask;
+          _inputDirty = false;
+        }
+
         await emulator.stepFrame();
         _pendingFrameMicros -= _emulatorFrameMicros;
         _pendingDisplayMicros += _emulatorFrameMicros;
@@ -188,11 +287,20 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
       _pendingDisplayMicros %= _targetDisplayMicros;
 
       final bytes = await emulator.getFrameBuffer();
+      if (session != _emulatorSession) {
+        return;
+      }
+
       if (bytes.length < _screenWidth * _screenHeight * 4) {
         return;
       }
 
       final image = await _decodeFrame(bytes);
+      if (session != _emulatorSession) {
+        image.dispose();
+        return;
+      }
+
       if (!mounted) {
         image.dispose();
         return;
@@ -211,8 +319,10 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
       });
     } finally {
       _isRendering = false;
-      if (_pendingFrameMicros >= _emulatorFrameMicros && mounted) {
-        unawaited(_renderNextFrame());
+      if (session == _emulatorSession &&
+          _pendingFrameMicros >= _emulatorFrameMicros &&
+          mounted) {
+        unawaited(_renderNextFrame(session));
       }
     }
   }
@@ -229,165 +339,229 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
     return completer.future;
   }
 
-  void _setButton(ButtonType button, bool pressed) {
-    final emulator = _emulator;
-    if (emulator == null) {
-      return;
+  int _currentPressedMask() {
+    return pressedMaskForButtons({
+      ..._touchButtons,
+      ..._dpadButtons,
+      ..._keyboardButtons,
+    });
+  }
+
+  void _syncButtons() {
+    _inputDirty = true;
+    if (kDebugMode && mounted) {
+      setState(() {});
     }
+  }
+
+  void _setButton(ButtonType button, bool pressed) {
+    _requestInputFocus();
 
     if (pressed) {
-      if (!_pressedButtons.add(button)) {
+      if (!_touchButtons.add(button)) {
         return;
       }
     } else {
-      if (!_pressedButtons.remove(button)) {
+      if (!_touchButtons.remove(button)) {
         return;
       }
     }
 
-    _inputRevision += 1;
-    unawaited(
-      emulator.syncButtons(
-        pressedMask: _buildPressedMask(),
-        revision: _inputRevision,
-      ),
-    );
+    _syncButtons();
   }
 
   void _setDPadButtons(Set<ButtonType> buttons) {
-    final emulator = _emulator;
-    if (emulator == null || setEquals(buttons, _dpadButtons)) {
+    _requestInputFocus();
+
+    if (setEquals(buttons, _dpadButtons)) {
       return;
     }
 
-    _pressedButtons.removeAll(_dpadButtons);
     _dpadButtons
       ..clear()
       ..addAll(buttons);
-    _pressedButtons.addAll(_dpadButtons);
 
-    _inputRevision += 1;
-    unawaited(
-      emulator.syncButtons(
-        pressedMask: _buildPressedMask(),
-        revision: _inputRevision,
-      ),
-    );
+    _syncButtons();
   }
 
-  int _buildPressedMask() {
-    var mask = 0;
-    for (final button in _pressedButtons) {
-      mask |= switch (button) {
-        ButtonType.a => 1 << 0,
-        ButtonType.b => 1 << 1,
-        ButtonType.start => 1 << 2,
-        ButtonType.select => 1 << 3,
-        ButtonType.up => 1 << 4,
-        ButtonType.down => 1 << 5,
-        ButtonType.left => 1 << 6,
-        ButtonType.right => 1 << 7,
-      };
+  ButtonType? _buttonForKey(LogicalKeyboardKey key) {
+    if (key == LogicalKeyboardKey.arrowUp || key == LogicalKeyboardKey.keyW) {
+      return ButtonType.up;
     }
-    return mask;
+    if (key == LogicalKeyboardKey.arrowDown || key == LogicalKeyboardKey.keyS) {
+      return ButtonType.down;
+    }
+    if (key == LogicalKeyboardKey.arrowLeft || key == LogicalKeyboardKey.keyA) {
+      return ButtonType.left;
+    }
+    if (key == LogicalKeyboardKey.arrowRight ||
+        key == LogicalKeyboardKey.keyD) {
+      return ButtonType.right;
+    }
+    if (key == LogicalKeyboardKey.keyJ || key == LogicalKeyboardKey.keyZ) {
+      return ButtonType.a;
+    }
+    if (key == LogicalKeyboardKey.keyK || key == LogicalKeyboardKey.keyX) {
+      return ButtonType.b;
+    }
+    if (key == LogicalKeyboardKey.enter) {
+      return ButtonType.start;
+    }
+    if (key == LogicalKeyboardKey.shiftLeft ||
+        key == LogicalKeyboardKey.shiftRight ||
+        key == LogicalKeyboardKey.space) {
+      return ButtonType.select;
+    }
+
+    return null;
+  }
+
+  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+    final button = _buttonForKey(event.logicalKey);
+    if (button == null) {
+      return KeyEventResult.ignored;
+    }
+
+    var changed = false;
+    if (event is KeyDownEvent || event is KeyRepeatEvent) {
+      changed = _keyboardButtons.add(button);
+    } else if (event is KeyUpEvent) {
+      changed = _keyboardButtons.remove(button);
+    }
+
+    if (changed) {
+      _syncButtons();
+    }
+
+    return KeyEventResult.handled;
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: SafeArea(
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            return SingleChildScrollView(
-              physics: const NeverScrollableScrollPhysics(),
-              padding: const EdgeInsets.all(20),
-              child: ConstrainedBox(
-                constraints: BoxConstraints(minHeight: constraints.maxHeight),
-                child: Column(
-                  children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            'Flutter GameBoy',
-                            style: Theme.of(context).textTheme.headlineMedium,
-                          ),
-                        ),
-                        FilledButton(
-                          onPressed: _loadingRom ? null : _pickRomAndStart,
-                          child: Text(_loadingRom ? '載入中...' : '選擇 ROM'),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 16),
-                    Container(
-                      width: constraints.maxWidth,
-                      padding: const EdgeInsets.all(20),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFB7C5A4),
-                        borderRadius: BorderRadius.circular(28),
-                        boxShadow: const [
-                          BoxShadow(
-                            color: Color(0x33000000),
-                            blurRadius: 24,
-                            offset: Offset(0, 10),
-                          ),
-                        ],
+      body: Focus(
+        autofocus: true,
+        canRequestFocus: true,
+        descendantsAreFocusable: false,
+        focusNode: _focusNode,
+        onFocusChange: (_) {
+          if (kDebugMode && mounted) {
+            setState(() {});
+          }
+        },
+        onKeyEvent: _handleKeyEvent,
+        child: Listener(
+          behavior: HitTestBehavior.translucent,
+          onPointerDown: (_) => _requestInputFocus(),
+          child: SafeArea(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                return Scrollbar(
+                  controller: _scrollController,
+                  thumbVisibility: _shouldEnableScroll,
+                  child: SingleChildScrollView(
+                    controller: _scrollController,
+                    physics: _shouldEnableScroll
+                        ? const ClampingScrollPhysics()
+                        : const NeverScrollableScrollPhysics(),
+                    padding: const EdgeInsets.all(20),
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        minHeight: constraints.maxHeight,
                       ),
-                      child: AspectRatio(
-                        aspectRatio: 10 / 9,
-                        child: Container(
-                          padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF2A3329),
-                            borderRadius: BorderRadius.circular(18),
+                      child: Column(
+                        children: [
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  'Flutter GameBoy',
+                                  style: Theme.of(
+                                    context,
+                                  ).textTheme.headlineMedium,
+                                ),
+                              ),
+                              FilledButton(
+                                onPressed: _loadingRom
+                                    ? null
+                                    : _pickRomAndStart,
+                                child: Text(_loadingRom ? '載入中...' : '選擇 ROM'),
+                              ),
+                            ],
                           ),
-                          child: ClipRRect(
-                            borderRadius: BorderRadius.circular(10),
-                            child: ColoredBox(
-                              color: const Color(0xFF8BAC0F),
-                              child: ValueListenableBuilder<ui.Image?>(
-                                valueListenable: _frameImageNotifier,
-                                builder: (context, image, child) {
-                                  return image == null
-                                      ? const Center(
-                                          child: Text(
-                                            '請先載入 .gb ROM',
-                                            style: TextStyle(
-                                              color: Color(0xFF1F2A1A),
-                                              fontWeight: FontWeight.w700,
-                                            ),
-                                          ),
-                                        )
-                                      : RawImage(
-                                          image: image,
-                                          fit: BoxFit.contain,
-                                          filterQuality: FilterQuality.none,
-                                        );
-                                },
+                          const SizedBox(height: 16),
+                          Container(
+                            width: constraints.maxWidth,
+                            padding: const EdgeInsets.all(20),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFB7C5A4),
+                              borderRadius: BorderRadius.circular(28),
+                              boxShadow: const [
+                                BoxShadow(
+                                  color: Color(0x33000000),
+                                  blurRadius: 24,
+                                  offset: Offset(0, 10),
+                                ),
+                              ],
+                            ),
+                            child: AspectRatio(
+                              aspectRatio: 10 / 9,
+                              child: Container(
+                                padding: const EdgeInsets.all(16),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF2A3329),
+                                  borderRadius: BorderRadius.circular(18),
+                                ),
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(10),
+                                  child: ColoredBox(
+                                    color: const Color(0xFF8BAC0F),
+                                    child: ValueListenableBuilder<ui.Image?>(
+                                      valueListenable: _frameImageNotifier,
+                                      builder: (context, image, child) {
+                                        return image == null
+                                            ? const Center(
+                                                child: Text(
+                                                  '請先載入 .gb ROM',
+                                                  style: TextStyle(
+                                                    color: Color(0xFF1F2A1A),
+                                                    fontWeight: FontWeight.w700,
+                                                  ),
+                                                ),
+                                              )
+                                            : RawImage(
+                                                image: image,
+                                                fit: BoxFit.contain,
+                                                filterQuality:
+                                                    FilterQuality.none,
+                                              );
+                                      },
+                                    ),
+                                  ),
+                                ),
                               ),
                             ),
                           ),
-                        ),
+                          const SizedBox(height: 16),
+                          if (_status != null)
+                            Text(_status!, textAlign: TextAlign.center),
+                          const SizedBox(height: 24),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                            crossAxisAlignment: CrossAxisAlignment.center,
+                            children: [_buildDPad(), _buildActionButtons()],
+                          ),
+                          const SizedBox(height: 32),
+                          _buildSystemButtons(),
+                          const SizedBox(height: 24),
+                        ],
                       ),
                     ),
-                    const SizedBox(height: 16),
-                    if (_status != null)
-                      Text(_status!, textAlign: TextAlign.center),
-                    const SizedBox(height: 24),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                      crossAxisAlignment: CrossAxisAlignment.center,
-                      children: [_buildDPad(), _buildActionButtons()],
-                    ),
-                    const SizedBox(height: 32),
-                    _buildSystemButtons(),
-                    const SizedBox(height: 24),
-                  ],
-                ),
-              ),
-            );
-          },
+                  ),
+                );
+              },
+            ),
+          ),
         ),
       ),
     );
@@ -623,26 +797,39 @@ class _PillButton extends StatelessWidget {
       children: [
         _MultiTouchButton(
           onChanged: onChanged,
-          child: Transform.rotate(
-            angle: -0.4,
-            child: Container(
-              width: 64,
-              height: 20,
-              decoration: BoxDecoration(
-                color: const Color(0xFF2E3D31),
-                borderRadius: BorderRadius.circular(10),
+          child: SizedBox(
+            width: 116,
+            height: 64,
+            child: Center(
+              child: Transform.rotate(
+                angle: -0.4,
+                child: Container(
+                  width: 100,
+                  height: 28,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF2E3D31),
+                    borderRadius: BorderRadius.circular(14),
+                    boxShadow: const [
+                      BoxShadow(
+                        color: Color(0x22000000),
+                        blurRadius: 6,
+                        offset: Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: Text(
+                    label,
+                    style: const TextStyle(
+                      color: Color(0xFFE4EBD9),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 1.2,
+                    ),
+                  ),
+                ),
               ),
             ),
-          ),
-        ),
-        const SizedBox(height: 8),
-        Text(
-          label,
-          style: const TextStyle(
-            color: Color(0xFF314D36),
-            fontSize: 14,
-            fontWeight: FontWeight.w900,
-            letterSpacing: 2,
           ),
         ),
       ],

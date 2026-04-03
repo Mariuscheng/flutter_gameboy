@@ -8,6 +8,30 @@ use crate::ppu::Ppu;
 use crate::timer::Timer;
 use std::time::Instant;
 
+#[cfg(debug_assertions)]
+fn log_ff00_read(value: u8, select: u8, action_keys: u8, direction_keys: u8) {
+    let _ = (value, select, action_keys, direction_keys);
+}
+
+#[cfg(not(debug_assertions))]
+fn log_ff00_read(_value: u8, _select: u8, _action_keys: u8, _direction_keys: u8) {}
+
+#[cfg(debug_assertions)]
+fn log_ff00_write(value: u8, result: u8, select: u8, action_keys: u8, direction_keys: u8) {
+    let _ = (value, result, select, action_keys, direction_keys);
+}
+
+#[cfg(not(debug_assertions))]
+fn log_ff00_write(_value: u8, _result: u8, _select: u8, _action_keys: u8, _direction_keys: u8) {}
+
+#[cfg(debug_assertions)]
+pub(crate) fn log_joypad_interrupt_service(pc: u16, ie: u8, iff: u8) {
+    let _ = (pc, ie, iff);
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn log_joypad_interrupt_service(_pc: u16, _ie: u8, _iff: u8) {}
+
 // Custom error types for better error handling (Rust 1.93.0 improvements)
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -73,27 +97,27 @@ pub struct InterruptHandler {
 }
 
 struct GameBoyIoWrapper {
-    ppu: *const Ppu,
-    apu: *const Apu,
-    timer: *const Timer,
-    joypad: *const Joypad,
-    interrupt_handler: *const InterruptHandler,
+    ppu: *mut Ppu,
+    apu: *mut Apu,
+    timer: *mut Timer,
+    joypad: *mut Joypad,
+    interrupt_handler: *mut InterruptHandler,
 }
 
 impl GameBoyIoWrapper {
     fn new(
-        ppu: &Ppu,
-        apu: &Apu,
-        timer: &Timer,
-        joypad: &Joypad,
-        interrupt_handler: &InterruptHandler,
+        ppu: *mut Ppu,
+        apu: *mut Apu,
+        timer: *mut Timer,
+        joypad: *mut Joypad,
+        interrupt_handler: *mut InterruptHandler,
     ) -> Self {
         GameBoyIoWrapper {
-            ppu: std::ptr::from_ref(ppu),
-            apu: std::ptr::from_ref(apu),
-            timer: std::ptr::from_ref(timer),
-            joypad: std::ptr::from_ref(joypad),
-            interrupt_handler: std::ptr::from_ref(interrupt_handler),
+            ppu,
+            apu,
+            timer,
+            joypad,
+            interrupt_handler,
         }
     }
 }
@@ -104,7 +128,15 @@ impl IoHandler for GameBoyIoWrapper {
             match address {
                 0xFF00 => {
                     if !self.joypad.is_null() {
-                        (*self.joypad).read_register()
+                        let joypad = &*self.joypad;
+                        let value = joypad.read_register();
+                        log_ff00_read(
+                            value,
+                            joypad.select,
+                            joypad.action_keys,
+                            joypad.direction_keys,
+                        );
+                        value
                     } else {
                         0xFF
                     }
@@ -156,6 +188,13 @@ impl IoHandler for GameBoyIoWrapper {
                     if !self.joypad.is_null() {
                         let joypad = self.joypad as *mut Joypad;
                         (*joypad).write_register(value);
+                        log_ff00_write(
+                            value,
+                            (*joypad).read_register(),
+                            (*joypad).select,
+                            (*joypad).action_keys,
+                            (*joypad).direction_keys,
+                        );
                     }
                 }
                 0xFF04..=0xFF07 => {
@@ -220,21 +259,26 @@ impl GameBoy {
         });
 
         // 設置 I/O 處理器
+        let ppu_ptr = std::ptr::addr_of_mut!(gb.ppu);
+        let apu_ptr = std::ptr::addr_of_mut!(gb.apu);
+        let timer_ptr = std::ptr::addr_of_mut!(gb.timer);
+        let joypad_ptr = std::ptr::addr_of_mut!(gb.joypad);
+        let interrupt_handler_ptr = std::ptr::addr_of_mut!(gb.interrupt_handler);
+
         let io_wrapper = GameBoyIoWrapper::new(
-            &gb.ppu,
-            &gb.apu,
-            &gb.timer,
-            &gb.joypad,
-            &gb.interrupt_handler,
+            ppu_ptr,
+            apu_ptr,
+            timer_ptr,
+            joypad_ptr,
+            interrupt_handler_ptr,
         );
         gb.mmu.set_io_handler(Box::new(io_wrapper));
 
         // 讓 MMU 能依 PPU mode 套用 VRAM/OAM CPU 存取限制
-        gb.mmu.set_ppu(&gb.ppu);
+        gb.mmu.set_ppu(ppu_ptr);
 
         // 設置組件間的引用
-        gb.joypad
-            .set_interrupt_handler(&mut gb.interrupt_handler as *mut InterruptHandler);
+        gb.joypad.set_interrupt_handler(interrupt_handler_ptr);
 
         // 設置初始硬體狀態 (模擬啟動後狀態)
         gb.mmu.write_byte(0xFFFF, 0x00); // 關閉所有中斷
@@ -247,10 +291,12 @@ impl GameBoy {
 
     // 載入 ROM
     pub fn load_rom(&mut self, path: &str) -> Result<(), GameBoyError> {
-        self.mmu.load_rom(path).map_err(|e| GameBoyError::RomLoad {
-            path: path.to_string(),
-            source: e,
-        })?;
+        self.mmu
+            .load_rom_from_bytes(std::fs::read(path).unwrap())
+            .map_err(|e| GameBoyError::RomLoad {
+                path: path.to_string(),
+                source: e,
+            })?;
 
         self.interrupt_handler.auto_configure_for_game(
             std::path::Path::new(path)
@@ -304,36 +350,35 @@ impl GameBoy {
         self.ppu.get_present_framebuffer()
     }
 
+    fn consume_external_interrupts(&mut self) {
+        let external_flags = self.interrupt_handler.if_register;
+        if external_flags != 0 {
+            let merged_if = self.mmu.read_byte(0xFF0F) | external_flags | 0xE0;
+            self.mmu.write_byte(0xFF0F, merged_if);
+            self.mmu.if_reg = merged_if;
+            self.interrupt_handler.if_register = 0;
+        }
+    }
+
     // 執行一個 CPU 指令，並在執行期間同步更新 Timer 和 PPU
     fn step_cpu_with_timing(&mut self) -> u32 {
-        // 同步中斷處理器與 MMU
-        self.interrupt_handler.ie_register = self.mmu.read_byte(0xFFFF);
-        self.interrupt_handler.if_register = self.mmu.read_byte(0xFF0F);
+        // 1. 將按鍵等外部觸發的中斷標記匯入 MMU
+        self.consume_external_interrupts();
 
-        // 執行 CPU 指令
+        // 2. 執行一次 CPU 指令
         let cycles = self.cpu.step(&mut self.mmu);
 
-        // 同步中斷處理器 FROM MMU（CPU 執行期間可能修改了 IF/IE）
-        self.interrupt_handler.ie_register = self.mmu.read_byte(0xFFFF);
-        self.interrupt_handler.if_register = self.mmu.read_byte(0xFF0F);
+        // 3. 取得執行後的 IF
+        let mut if_reg = self.mmu.read_byte(0xFF0F);
 
-        // 批量更新 PPU 和 Timer
-        let mut if_reg = self.interrupt_handler.if_register;
+        // 4. 更新組件
         for _cycle in 0..cycles {
             self.ppu.tick(&self.mmu, &mut if_reg);
             self.timer.tick(&mut if_reg);
             self.apu.tick();
-
-            // 處理 joypad 中斷延遲
-            if self.interrupt_handler.process_joypad_interrupt_delay() {
-                if_reg |= 0x10; // Joypad interrupt flag
-            }
         }
 
-        // 更新中斷處理器
-        self.interrupt_handler.if_register = if_reg;
-
-        // 同步回 MMU
+        // 5. 寫回 MMU
         self.mmu.write_byte(0xFF0F, if_reg);
         self.mmu.if_reg = if_reg;
 
@@ -343,7 +388,7 @@ impl GameBoy {
     // 獲取當前畫面緩衝區
     #[allow(dead_code)]
     pub fn get_framebuffer(&self) -> &[u8] {
-        self.ppu.get_framebuffer()
+        self.ppu.get_present_framebuffer()
     }
 }
 
@@ -400,15 +445,7 @@ impl InterruptHandler {
             InterruptType::Joypad => 4,
         };
 
-        if matches!(interrupt_type, InterruptType::Joypad) {
-            if self.joypad_interrupt_delay.is_none() {
-                self.joypad_interrupt_delay = Some(JoypadInterruptDelay {
-                    cycles_remaining: 4,
-                });
-            }
-        } else {
-            self.if_register = (self.if_register | (1 << bit)) | 0xE0;
-        }
+        self.if_register = (self.if_register | (1 << bit)) | 0xE0;
     }
 
     pub fn process_joypad_interrupt_delay(&mut self) -> bool {
@@ -444,5 +481,59 @@ impl InterruptHandler {
 impl Default for InterruptHandler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GameBoy;
+    use crate::cpu::{CpuState, InterruptMasterState};
+    use crate::joypad::JoypadKey;
+
+    #[test]
+    fn joypad_interrupt_is_forwarded_into_mmu_if_register() {
+        let mut gameboy = GameBoy::new();
+
+        gameboy.joypad.write_register(0x20);
+        gameboy.joypad.set_key(JoypadKey::Right, true);
+
+        assert_eq!(gameboy.interrupt_handler.if_register & 0x10, 0x10);
+
+        gameboy.consume_external_interrupts();
+
+        assert_eq!(gameboy.mmu.read_byte(0xFF0F) & 0x10, 0x10);
+        assert_eq!(gameboy.interrupt_handler.if_register & 0x1F, 0x00);
+    }
+
+    #[test]
+    fn cpu_reads_selected_ff00_row_from_mmu() {
+        let mut gameboy = GameBoy::new();
+
+        gameboy.mmu.write_byte(0xFF00, 0x20);
+        gameboy.joypad.set_key(JoypadKey::Right, true);
+
+        assert_eq!(gameboy.mmu.read_byte(0xFF00) & 0x0F, 0x0E);
+
+        gameboy.mmu.write_byte(0xFF00, 0x10);
+        gameboy.joypad.set_key(JoypadKey::Start, true);
+
+        assert_eq!(gameboy.mmu.read_byte(0xFF00) & 0x0F, 0x07);
+    }
+
+    #[test]
+    fn joypad_interrupt_wakes_halted_cpu() {
+        let mut gameboy = GameBoy::new();
+
+        gameboy.cpu.state = CpuState::Halted;
+        gameboy.cpu.ime = InterruptMasterState::Enabled;
+        gameboy.mmu.write_byte(0xFFFF, 0x10);
+        gameboy.mmu.write_byte(0xFF00, 0x20);
+        gameboy.joypad.set_key(JoypadKey::Right, true);
+
+        let cycles = gameboy.step_cpu_with_timing();
+
+        assert_eq!(cycles, 20);
+        assert_eq!(gameboy.cpu.state, CpuState::Running);
+        assert_eq!(gameboy.cpu.pc, 0x60);
     }
 }

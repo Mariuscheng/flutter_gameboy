@@ -191,6 +191,10 @@ impl Cpu {
                 iff &= !(1 << interrupt_bit);
                 mmu.write_byte(0xFF0F, iff);
 
+                if interrupt_bit == 4 {
+                    crate::gameboy::log_joypad_interrupt_service(self.pc, ie, iff);
+                }
+
                 // 推入當前 PC 到堆疊並跳轉
                 let current_pc = self.pc;
                 self.push_word(mmu, current_pc);

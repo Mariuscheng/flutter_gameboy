@@ -5,7 +5,6 @@ mod instructions;
 pub mod joypad;
 mod mmu;
 pub mod ppu;
-mod rom;
 mod timer;
 
 pub mod api;

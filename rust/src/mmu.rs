@@ -1,17 +1,7 @@
 // 記憶體管理單元 (MMU) - 負責 CPU 與記憶體/I/O 的通訊
 // 整合操作碼資料和記憶體映射
 
-use crate::cpu; // 引用 cpu 模組
 use crate::ppu::{LcdMode, Ppu};
-use crate::rom; // 引用 rom 模組
-
-#[allow(dead_code)]
-pub trait Memory {
-    fn read_byte(&self, address: u16) -> u8;
-    fn write_byte(&mut self, address: u16, value: u8);
-    fn read_word(&self, address: u16) -> u16;
-    fn write_word(&mut self, address: u16, value: u16);
-}
 
 pub trait IoHandler {
     fn read_io(&self, address: u16) -> u8;
@@ -48,7 +38,7 @@ pub struct Mmu {
     io_handler: Option<Box<dyn IoHandler>>,
 
     // 供 CPU-side VRAM/OAM 存取限制使用（PPU 內部讀取不受限）
-    ppu: Option<*const Ppu>,
+    ppu: Option<*mut Ppu>,
 }
 
 impl Mmu {
@@ -82,37 +72,8 @@ impl Mmu {
         self.io_handler = Some(handler);
     }
 
-    pub fn set_ppu(&mut self, ppu: &Ppu) {
-        self.ppu = Some(std::ptr::from_ref(ppu));
-    }
-
-    // 獲取操作碼引用 (現在改為引用全域靜態變數)
-    #[allow(dead_code)]
-    pub fn get_opcodes(&self) -> &cpu::Opcodes {
-        &cpu::OPCODES
-    }
-}
-
-impl Memory for Mmu {
-    fn read_byte(&self, address: u16) -> u8 {
-        self.read_byte(address)
-    }
-
-    fn write_byte(&mut self, address: u16, value: u8) {
-        self.write_byte(address, value);
-    }
-
-    fn read_word(&self, address: u16) -> u16 {
-        let low = self.read_byte(address);
-        let high = self.read_byte(address + 1);
-        ((high as u16) << 8) | (low as u16)
-    }
-
-    fn write_word(&mut self, address: u16, value: u16) {
-        let low = (value & 0xFF) as u8;
-        let high = ((value >> 8) & 0xFF) as u8;
-        self.write_byte(address, low);
-        self.write_byte(address + 1, high);
+    pub fn set_ppu(&mut self, ppu: *mut Ppu) {
+        self.ppu = Some(ppu);
     }
 }
 
@@ -278,8 +239,9 @@ impl Mmu {
                 } else if address == 0xFF02 {
                     // Serial Control (SC)
                     self.serial_control = value;
-                    // 如果啟動了傳輸 (Bit 7 為 1)
-                    if (value & 0x80) != 0 {
+                    // DMG 只有在 internal clock (bit 0) 且 start (bit 7) 同時為 1 時，
+                    // 才會在本機上完成傳輸並觸發 Serial interrupt。
+                    if (value & 0x81) == 0x81 {
                         // 捕獲串口輸出 (用於測試 ROM)
                         let char_byte = self.serial_data;
                         if (0x20..0x7F).contains(&char_byte) {
@@ -329,18 +291,10 @@ impl Mmu {
     }
 
     // 載入 ROM 資料
-    pub fn load_rom(&mut self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let rom_data = rom::read_rom_file(path)?;
-        self.load_rom_from_bytes(rom_data)
-    }
-
     pub fn load_rom_from_bytes(
         &mut self,
         rom_data: Vec<u8>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // 偵錯資訊：確認載入成功
-        println!("成功載入 ROM 陣列 (大小: {} bytes)", rom_data.len());
-
         // 重新分配 self.rom 以處理不同大小的 ROM (MBC)
         self.rom = rom_data;
 
@@ -375,7 +329,6 @@ impl Mmu {
         if let Ok(data) = std::fs::read("save.sav") {
             let len = data.len().min(self.ext_ram.len());
             self.ext_ram[..len].copy_from_slice(&data[..len]);
-            println!("已載入存檔: save.sav ({} bytes)", len);
         }
     }
 
@@ -383,8 +336,6 @@ impl Mmu {
         if !self.ext_ram.is_empty() {
             if let Err(e) = std::fs::write("save.sav", &self.ext_ram) {
                 eprintln!("存檔失敗: {}", e);
-            } else {
-                println!("存檔成功: save.sav");
             }
         }
     }
@@ -396,5 +347,34 @@ impl Mmu {
             let byte = self.read_byte_ppu(source_base + i);
             self.oam[i as usize] = byte;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Mmu;
+
+    #[test]
+    fn external_clock_serial_transfer_does_not_raise_interrupt() {
+        let mut mmu = Mmu::new();
+
+        mmu.write_byte(0xFF01, b'A');
+        mmu.write_byte(0xFF02, 0x80);
+
+        assert_eq!(mmu.if_reg & 0x08, 0x00);
+        assert_eq!(mmu.serial_control & 0x80, 0x80);
+        assert!(mmu.serial_output.is_empty());
+    }
+
+    #[test]
+    fn internal_clock_serial_transfer_raises_interrupt() {
+        let mut mmu = Mmu::new();
+
+        mmu.write_byte(0xFF01, b'A');
+        mmu.write_byte(0xFF02, 0x81);
+
+        assert_eq!(mmu.if_reg & 0x08, 0x08);
+        assert_eq!(mmu.serial_control & 0x80, 0x00);
+        assert_eq!(mmu.serial_output, "A");
     }
 }

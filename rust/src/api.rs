@@ -1,3 +1,4 @@
+use crate::cpu::{CpuState, InterruptMasterState};
 use crate::gameboy::GameBoy;
 use crate::joypad::JoypadKey;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -5,8 +6,54 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::panic::{self, AssertUnwindSafe};
 use std::{
     collections::VecDeque,
+    fs,
     sync::{Arc, Mutex},
 };
+
+#[cfg(debug_assertions)]
+fn log_sync_buttons(
+    pressed_mask: u8,
+    revision: i32,
+    joyp: u8,
+    action_keys: u8,
+    direction_keys: u8,
+    select: u8,
+    pc: u16,
+    cpu_state: CpuState,
+    ime: InterruptMasterState,
+    ie: u8,
+    iff: u8,
+) {
+    let _ = (
+        pressed_mask,
+        revision,
+        joyp,
+        action_keys,
+        direction_keys,
+        select,
+        pc,
+        cpu_state,
+        ime,
+        ie,
+        iff,
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn log_sync_buttons(
+    _pressed_mask: u8,
+    _revision: i32,
+    _joyp: u8,
+    _action_keys: u8,
+    _direction_keys: u8,
+    _select: u8,
+    _pc: u16,
+    _cpu_state: CpuState,
+    _ime: InterruptMasterState,
+    _ie: u8,
+    _iff: u8,
+) {
+}
 
 const EMULATOR_SAMPLE_RATE: u32 = 44_100;
 const EMULATOR_FRAME_RATE: f32 = 59.7275;
@@ -29,8 +76,7 @@ const AUDIO_QUEUE_SECONDS: f32 = 0.18;
 #[allow(missing_debug_implementations)]
 pub struct GameBoyEmulator {
     core: Box<GameBoy>,
-    #[allow(dead_code)]
-    audio_player: Option<AudioPlayer>,
+    _audio_player: Option<AudioPlayer>,
     audio_buffer: Option<SharedAudioBufferHandle>,
     last_input_revision: i32,
 }
@@ -194,10 +240,16 @@ impl GameBoyEmulator {
 
         Ok(Self {
             core: gb,
-            audio_player,
+            _audio_player: audio_player,
             audio_buffer: audio_tx,
             last_input_revision: 0,
         })
+    }
+
+    pub fn new_from_path(path: String) -> Result<Self, String> {
+        let rom_bytes =
+            fs::read(&path).map_err(|error| format!("Failed to read ROM '{}': {}", path, error))?;
+        Self::new(rom_bytes)
     }
 
     pub fn step_frame(&mut self) {
@@ -233,12 +285,18 @@ impl GameBoyEmulator {
         rgba
     }
 
+    fn apply_button_state(&mut self, button: ButtonType, pressed: bool) {
+        // Joypad internally calls trigger_interrupt() if edge detected,
+        // which accumulates into self.core.interrupt_handler.if_register.
+        self.core.joypad.set_key(button.into(), pressed);
+    }
+
     pub fn press_button(&mut self, button: ButtonType) {
-        self.core.joypad.set_key(button.into(), true);
+        self.apply_button_state(button, true);
     }
 
     pub fn release_button(&mut self, button: ButtonType) {
-        self.core.joypad.set_key(button.into(), false);
+        self.apply_button_state(button, false);
     }
 
     pub fn sync_buttons(&mut self, pressed_mask: u8, revision: i32) {
@@ -258,10 +316,22 @@ impl GameBoyEmulator {
             ButtonType::Right,
         ] {
             let mask = button.mask();
-            self.core
-                .joypad
-                .set_key(button.into(), (pressed_mask & mask) != 0);
+            self.apply_button_state(button, (pressed_mask & mask) != 0);
         }
+
+        log_sync_buttons(
+            pressed_mask,
+            revision,
+            self.core.joypad.read_register(),
+            self.core.joypad.action_keys,
+            self.core.joypad.direction_keys,
+            self.core.joypad.select,
+            self.core.cpu.pc,
+            self.core.cpu.state,
+            self.core.cpu.ime,
+            self.core.mmu.ie,
+            self.core.mmu.read_byte(0xFF0F),
+        );
     }
 }
 
@@ -284,9 +354,7 @@ fn initialize_audio() -> (Option<AudioPlayer>, Option<SharedAudioBufferHandle>) 
 fn initialize_audio_impl() -> (Option<AudioPlayer>, Option<SharedAudioBufferHandle>) {
     let host = cpal::default_host();
     let device = host.default_output_device();
-
-    println!("Audio host: {:?}", host.id());
-    println!("Default audio device is_some = {:?}", device.is_some());
+    let _ = host.id();
 
     let mut audio_player = None;
     let mut audio_buffer = None;
@@ -297,11 +365,6 @@ fn initialize_audio_impl() -> (Option<AudioPlayer>, Option<SharedAudioBufferHand
             let sample_rate = config.sample_rate();
             let stream_config = config.config();
             let channels = stream_config.channels as usize;
-
-            println!(
-                "Audio Config: sample_rate={}, channels={}",
-                sample_rate, channels
-            );
 
             let latency_frames = (sample_rate as f32 * AUDIO_LATENCY_SECONDS) as usize;
             let max_samples = ((EMULATOR_SAMPLE_RATE as f32 * AUDIO_QUEUE_SECONDS) as usize)
@@ -364,20 +427,13 @@ fn initialize_audio_impl() -> (Option<AudioPlayer>, Option<SharedAudioBufferHand
 
             match stream_res {
                 Ok(s) => {
-                    println!("Audio stream built successfully, starting playback");
                     s.play().ok();
                     audio_player = Some(AudioPlayer { _stream: s });
                     audio_buffer = Some(shared_buffer);
                 }
-                Err(e) => {
-                    println!("Failed to build output stream: {:?}", e);
-                }
+                Err(_e) => {}
             }
-        } else {
-            println!("Failed to get default output config for device");
         }
-    } else {
-        println!("No audio output device found.");
     }
 
     (audio_player, audio_buffer)
