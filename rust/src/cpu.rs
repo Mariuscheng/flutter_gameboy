@@ -70,6 +70,7 @@ pub enum FlagState {
 }
 
 // CPU 結構 - 包含 MMU
+#[derive(Debug)]
 pub struct Cpu {
     pub pc: u16,                   // 程式計數器
     pub sp: u16,                   // 堆疊指標

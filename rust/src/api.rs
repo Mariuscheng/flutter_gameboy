@@ -10,6 +10,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+// 11 個參數就是一次按鍵同步的完整除錯快照；為了消 lint 而包成 struct
+// 只會讓呼叫端多一層無意義的組裝，因此在這裡單點放行。
+#[allow(clippy::too_many_arguments)]
 #[cfg(debug_assertions)]
 fn log_sync_buttons(
     pressed_mask: u8,
@@ -39,6 +42,8 @@ fn log_sync_buttons(
     );
 }
 
+// 與 debug 版本同簽名，參數數量同理需要在這裡單點放行。
+#[allow(clippy::too_many_arguments)]
 #[cfg(not(debug_assertions))]
 fn log_sync_buttons(
     _pressed_mask: u8,
@@ -258,10 +263,10 @@ impl GameBoyEmulator {
         // Output audio
         if let Some(buffer) = &self.audio_buffer {
             let samples = self.core.apu.drain_samples();
-            if !samples.is_empty() {
-                if let Ok(mut shared_buffer) = buffer.lock() {
-                    shared_buffer.push_samples(&samples);
-                }
+            if !samples.is_empty()
+                && let Ok(mut shared_buffer) = buffer.lock()
+            {
+                shared_buffer.push_samples(&samples);
             }
         }
     }
@@ -359,80 +364,80 @@ fn initialize_audio_impl() -> (Option<AudioPlayer>, Option<SharedAudioBufferHand
     let mut audio_player = None;
     let mut audio_buffer = None;
 
-    if let Some(dev) = device {
-        if let Ok(config) = dev.default_output_config() {
-            let sample_format = config.sample_format();
-            let sample_rate = config.sample_rate();
-            let stream_config = config.config();
-            let channels = stream_config.channels as usize;
+    if let Some(dev) = device
+        && let Ok(config) = dev.default_output_config()
+    {
+        let sample_format = config.sample_format();
+        let sample_rate = config.sample_rate();
+        let stream_config = config.config();
+        let channels = stream_config.channels as usize;
 
-            let latency_frames = (sample_rate as f32 * AUDIO_LATENCY_SECONDS) as usize;
-            let max_samples = ((EMULATOR_SAMPLE_RATE as f32 * AUDIO_QUEUE_SECONDS) as usize)
-                .max(latency_frames * AUDIO_BUFFER_MULTIPLIER);
-            let shared_buffer = Arc::new(Mutex::new(SharedAudioBuffer::new(max_samples)));
+        let latency_frames = (sample_rate as f32 * AUDIO_LATENCY_SECONDS) as usize;
+        let max_samples = ((EMULATOR_SAMPLE_RATE as f32 * AUDIO_QUEUE_SECONDS) as usize)
+            .max(latency_frames * AUDIO_BUFFER_MULTIPLIER);
+        let shared_buffer = Arc::new(Mutex::new(SharedAudioBuffer::new(max_samples)));
 
-            let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
+        let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
 
-            let stream_res = match sample_format {
-                cpal::SampleFormat::F32 => {
-                    let mut output = AudioOutputState::new(
-                        Arc::clone(&shared_buffer),
-                        EMULATOR_SAMPLE_RATE,
-                        sample_rate,
-                        channels,
-                    );
-                    dev.build_output_stream(
-                        &stream_config,
-                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            output.fill_f32_buffer(data);
-                        },
-                        err_fn,
-                        None,
-                    )
-                }
-                cpal::SampleFormat::I16 => {
-                    let mut output = AudioOutputState::new(
-                        Arc::clone(&shared_buffer),
-                        EMULATOR_SAMPLE_RATE,
-                        sample_rate,
-                        channels,
-                    );
-                    dev.build_output_stream(
-                        &stream_config,
-                        move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                            output.fill_i16_buffer(data);
-                        },
-                        err_fn,
-                        None,
-                    )
-                }
-                cpal::SampleFormat::U16 => {
-                    let mut output = AudioOutputState::new(
-                        Arc::clone(&shared_buffer),
-                        EMULATOR_SAMPLE_RATE,
-                        sample_rate,
-                        channels,
-                    );
-                    dev.build_output_stream(
-                        &stream_config,
-                        move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
-                            output.fill_u16_buffer(data);
-                        },
-                        err_fn,
-                        None,
-                    )
-                }
-                _ => Err(cpal::BuildStreamError::StreamConfigNotSupported),
-            };
-
-            match stream_res {
-                Ok(s) => {
-                    s.play().ok();
-                    audio_player = Some(AudioPlayer { _stream: s });
-                    audio_buffer = Some(shared_buffer);
-                }
-                Err(_e) => {}
+        let stream_res = match sample_format {
+            cpal::SampleFormat::F32 => {
+                let mut output = AudioOutputState::new(
+                    Arc::clone(&shared_buffer),
+                    EMULATOR_SAMPLE_RATE,
+                    sample_rate,
+                    channels,
+                );
+                dev.build_output_stream(
+                    &stream_config,
+                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        output.fill_f32_buffer(data);
+                    },
+                    err_fn,
+                    None,
+                )
             }
+            cpal::SampleFormat::I16 => {
+                let mut output = AudioOutputState::new(
+                    Arc::clone(&shared_buffer),
+                    EMULATOR_SAMPLE_RATE,
+                    sample_rate,
+                    channels,
+                );
+                dev.build_output_stream(
+                    &stream_config,
+                    move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                        output.fill_i16_buffer(data);
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            cpal::SampleFormat::U16 => {
+                let mut output = AudioOutputState::new(
+                    Arc::clone(&shared_buffer),
+                    EMULATOR_SAMPLE_RATE,
+                    sample_rate,
+                    channels,
+                );
+                dev.build_output_stream(
+                    &stream_config,
+                    move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
+                        output.fill_u16_buffer(data);
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            _ => Err(cpal::BuildStreamError::StreamConfigNotSupported),
+        };
+
+        match stream_res {
+            Ok(s) => {
+                s.play().ok();
+                audio_player = Some(AudioPlayer { _stream: s });
+                audio_buffer = Some(shared_buffer);
+            }
+            Err(_e) => {}
         }
     }
 

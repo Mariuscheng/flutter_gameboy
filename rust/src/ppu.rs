@@ -35,6 +35,7 @@ impl Sprite {
     }
 }
 
+#[derive(Debug)]
 pub struct Ppu {
     // LCD 控制寄存器
     pub lcdc: u8, // 0xFF40 - LCD 控制
@@ -73,6 +74,13 @@ pub struct Ppu {
 
     // 幀完成旗標：在進入 VBlank 時置位，供外部同步顯示
     frame_ready: bool,
+
+    // 目前掃描線的長度（dot）。LCD 剛開啟的第一條線較短（452），之後恢復 456。
+    line_length: u16,
+
+    // mode 2 期間，PPU 目前正在讀取的 OAM row（位元組位移，OAM 每 row 8 bytes）。
+    // 不在 mode 2 時為 None；OAM corruption bug 會用到。
+    pub oam_row: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -81,6 +89,12 @@ pub enum LcdMode {
     VBlank = 1,        // 垂直空白期
     OamSearch = 2,     // OAM 搜索
     PixelTransfer = 3, // 像素傳輸
+}
+
+impl Default for Ppu {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Ppu {
@@ -107,6 +121,8 @@ impl Ppu {
             window_line_counter: 0,
             window_triggered: false,
             frame_ready: false,
+            line_length: 456,
+            oam_row: None,
         }
     }
 
@@ -153,12 +169,17 @@ impl Ppu {
                         self.mode = LcdMode::HBlank;
                         self.stat = (self.stat & 0xFC) | (LcdMode::HBlank as u8);
                         self.framebuffer.fill(0);
+                        self.oam_row = None;
+                        self.line_length = 456;
                     }
                     (false, true) => {
                         self.ly = 0;
                         self.dots = 0;
+                        // 剛開啟 LCD 的第一條掃描線比正常短 4 個 dot
+                        self.line_length = 452;
                         self.mode = LcdMode::OamSearch;
                         self.stat = (self.stat & 0xFC) | (LcdMode::OamSearch as u8);
+                        self.oam_row = None;
                     }
                     _ => {}
                 }
@@ -203,21 +224,9 @@ impl Ppu {
 
         // Mode 中斷
         match self.mode {
-            LcdMode::HBlank => {
-                if (self.stat & 0x08) != 0 {
-                    irq = Some(());
-                }
-            }
-            LcdMode::VBlank => {
-                if (self.stat & 0x10) != 0 {
-                    irq = Some(());
-                }
-            }
-            LcdMode::OamSearch => {
-                if (self.stat & 0x20) != 0 {
-                    irq = Some(());
-                }
-            }
+            LcdMode::HBlank if (self.stat & 0x08) != 0 => irq = Some(()),
+            LcdMode::VBlank if (self.stat & 0x10) != 0 => irq = Some(()),
+            LcdMode::OamSearch if (self.stat & 0x20) != 0 => irq = Some(()),
             _ => {}
         }
 
@@ -307,6 +316,7 @@ impl Ppu {
     // PPU 主時鐘滴答 - 每個 T-狀態調用一次
     pub fn tick(&mut self, mmu: &crate::mmu::Mmu, interrupt_flags: &mut u8) {
         if self.lcd_state() == EnableState::Disabled {
+            self.oam_row = None;
             return;
         }
 
@@ -314,6 +324,20 @@ impl Ppu {
 
         match self.mode {
             LcdMode::OamSearch => {
+                // mode 2 每 4 個 T-cycle（1 M-cycle）讀取一個 OAM row（8 bytes），
+                // 但第一 row（objects 0/1）不會被 OAM bug 影響，所以對外只回報 row 1..19。
+                let shifted = self.dots as i32 - 1;
+                self.oam_row = if shifted >= 0 {
+                    let index = shifted / 4;
+                    if index <= 18 {
+                        Some(8 + 8 * index as u16)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 // 每 2 個點檢查一個精靈
                 // dots 從 1 開始，所以 dots=1,2 檢查 sprite 0，dots=3,4 檢查 sprite 1，以此類推
                 if self.dots.is_multiple_of(2) {
@@ -330,15 +354,18 @@ impl Ppu {
                 }
             }
             LcdMode::PixelTransfer => {
+                self.oam_row = None;
                 if self.dots >= 252 {
                     self.render_scanline(mmu);
                     self.change_mode(LcdMode::HBlank, interrupt_flags);
                 }
             }
             LcdMode::HBlank => {
-                if self.dots >= 456 {
+                self.oam_row = None;
+                if self.dots >= self.line_length {
                     self.dots = 0;
                     self.ly += 1;
+                    self.line_length = 456;
                     self.update_stat(interrupt_flags);
 
                     if self.ly >= 144 {
@@ -352,6 +379,7 @@ impl Ppu {
                 }
             }
             LcdMode::VBlank => {
+                self.oam_row = None;
                 if self.dots >= 456 {
                     self.dots = 0;
                     self.ly += 1;

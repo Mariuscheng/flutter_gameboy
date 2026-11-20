@@ -71,3 +71,37 @@ app.*.map.json
 # Native/Flutter generated intermediates
 **/ephemeral/
 **/.cxx/
+
+# -----------------------------------------------------------------------------
+# Local-only：測試、腳本與測試執行檔不上傳
+# -----------------------------------------------------------------------------
+# 任何層級的 test / tests 資料夾（含 Flutter 的 integration_test、test_driver）
+test/
+tests/
+integration_test/
+test_driver/
+
+# 任何層級的 script / scripts 資料夾
+script/
+scripts/
+
+# 測試用執行檔（Windows 編譯產物）
+*.test.exe
+*_test.exe
+test.exe
+tests.exe
+
+# 除錯設定與除錯輸出
+/.vscode/
+/out/
+*.ppm
+
+# 建置產物（任何層級）
+**/build/
+**/target/
+**/.gradle/
+**/.cxx/
+
+# 測試用 ROM（第三方程式與商業 ROM，不上傳）
+/rom/
+

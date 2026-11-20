@@ -83,6 +83,28 @@ cargo test
 - 桌面版會載入打包後的 Rust DLL，因此修改 Rust 後需要重新 build 並確認 runner 使用的是最新 DLL。
 - 若是輸入異常，通常要同時檢查 Flutter mask、Joypad bit 對應、FF00 輪詢與中斷時序。
 
+## 程式碼品質（Anti-Slop Lint）
+
+本專案用嚴格的 analyzer / lint 規則防止程式碼退化成 AI slop。設定在 [`analysis_options.yaml`](analysis_options.yaml)，規則分類與例外政策見 [`docs/lint-policy.md`](docs/lint-policy.md)。
+
+提交前請在本機執行：
+
+```bash
+dart format --output=none --set-exit-if-changed lib
+flutter analyze --fatal-infos --fatal-warnings
+```
+
+CI（[`code-quality.yml`](.github/workflows/code-quality.yml)）會執行同樣的檢查；只要出現一個 lint info 就會擋下 PR。
+
+重點規則：
+
+- `strict-casts` / `strict-inference` / `strict-raw-types`：不允許隱式轉型、模糊推斷與 raw type。
+- 未使用的 import、區域變數、私有成員與死碼直接視為 **error**。
+- `unawaited_futures` / `discarded_futures`：Future 必須 `await` 或明確包成 `unawaited()`。
+- `avoid_catches_without_on_clauses`：不准用無型別的 `catch` 吞錯。
+
+`test/`、`integration_test/`、`test_driver/`、`script/`、`scripts/` 與測試執行檔屬本機開發用，不納入版本控制。
+
 ## ROM 與版權說明
 
 本專案僅作為技術研究、模擬器開發與 A.I. 協作案例展示。請僅使用你合法持有或可合法使用的 ROM 檔案。

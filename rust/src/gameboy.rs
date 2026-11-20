@@ -1,12 +1,51 @@
 // Game Boy 模擬器主結構
 
 use crate::apu::Apu;
-use crate::cpu::Cpu;
+use crate::cpu::{Cpu, CpuState, InterruptMasterState, OPCODES, Opcode};
 use crate::joypad::Joypad;
 use crate::mmu::{IoHandler, Mmu};
 use crate::ppu::Ppu;
 use crate::timer::Timer;
 use std::time::Instant;
+
+/// 這條指令會做幾次資料匯流排存取（不含程式計數器與堆疊）。
+///
+/// 讀-改-寫指令（INC/DEC (HL)、CB 的移位/旋轉/RES/SET (HL)）會先讀再寫，
+/// 其餘記憶體指令只有一次存取。硬體上單一存取在最後一個 cycle，
+/// 讀-改-寫則是倒數第二個 cycle 讀、最後一個 cycle 寫。
+fn bus_accesses(opcode: &Opcode) -> u32 {
+    let has_memory_operand = opcode
+        .operands
+        .iter()
+        .any(|operand| operand.immediate == Some(false));
+    if !has_memory_operand {
+        return 0;
+    }
+
+    let is_read_modify_write = matches!(
+        opcode.mnemonic.as_str(),
+        "INC"
+            | "DEC"
+            | "RLC"
+            | "RRC"
+            | "RL"
+            | "RR"
+            | "SLA"
+            | "SRA"
+            | "SRL"
+            | "SWAP"
+            | "RES"
+            | "SET"
+    );
+
+    if is_read_modify_write { 2 } else { 1 }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OamBusEvent {
+    Read(u16),
+    Write(u16),
+}
 
 #[cfg(debug_assertions)]
 fn log_ff00_read(value: u8, select: u8, action_keys: u8, direction_keys: u8) {
@@ -85,11 +124,13 @@ pub enum InterruptType {
 }
 
 /// Joypad interrupt delay tracking
+#[derive(Debug)]
 struct JoypadInterruptDelay {
     cycles_remaining: u8,
 }
 
 /// Interrupt handler
+#[derive(Debug)]
 pub struct InterruptHandler {
     pub ie_register: u8,
     pub if_register: u8,
@@ -122,60 +163,49 @@ impl GameBoyIoWrapper {
     }
 }
 
+/// 只有當子系統指標已接上時才執行 `f`，把「可為空」的判斷集中在這裡。
+unsafe fn write_if_present<T, F: FnOnce(&mut T)>(pointer: *mut T, f: F) {
+    // SAFETY: 呼叫端保證 `pointer` 要嘛是 null、要嘛指向仍存活的 `T`。
+    if let Some(target) = unsafe { pointer.as_mut() } {
+        f(target);
+    }
+}
+
 impl IoHandler for GameBoyIoWrapper {
     fn read_io(&self, address: u16) -> u8 {
+        // 子系統以 `Option` 表示「是否已接上」，避免每個分支重複 `is_null` 判斷。
         unsafe {
             match address {
-                0xFF00 => {
-                    if !self.joypad.is_null() {
-                        let joypad = &*self.joypad;
-                        let value = joypad.read_register();
-                        log_ff00_read(
-                            value,
-                            joypad.select,
-                            joypad.action_keys,
-                            joypad.direction_keys,
-                        );
-                        value
-                    } else {
-                        0xFF
-                    }
-                }
-                0xFF04..=0xFF07 => {
-                    if !self.timer.is_null() {
-                        (*self.timer).read_register(address)
-                    } else {
-                        0
-                    }
-                }
-                0xFF10..=0xFF3F => {
-                    if !self.apu.is_null() {
-                        (*self.apu).read_register(address)
-                    } else {
-                        0
-                    }
-                }
-                0xFF40..=0xFF4B => {
-                    if !self.ppu.is_null() {
-                        (*self.ppu).read_register(address)
-                    } else {
-                        0
-                    }
-                }
-                0xFF0F => {
-                    if !self.interrupt_handler.is_null() {
-                        (*self.interrupt_handler).if_register | 0xE0
-                    } else {
-                        0xE0
-                    }
-                }
-                0xFFFF => {
-                    if !self.interrupt_handler.is_null() {
-                        (*self.interrupt_handler).ie_register
-                    } else {
-                        0
-                    }
-                }
+                0xFF00 => self.joypad.as_ref().map_or(0xFF, |joypad| {
+                    let value = joypad.read_register();
+                    log_ff00_read(
+                        value,
+                        joypad.select,
+                        joypad.action_keys,
+                        joypad.direction_keys,
+                    );
+                    value
+                }),
+                0xFF04..=0xFF07 => self
+                    .timer
+                    .as_ref()
+                    .map_or(0, |timer| timer.read_register(address)),
+                0xFF10..=0xFF3F => self
+                    .apu
+                    .as_ref()
+                    .map_or(0, |apu| apu.read_register(address)),
+                0xFF40..=0xFF4B => self
+                    .ppu
+                    .as_ref()
+                    .map_or(0, |ppu| ppu.read_register(address)),
+                0xFF0F => self
+                    .interrupt_handler
+                    .as_ref()
+                    .map_or(0xE0, |handler| handler.if_register | 0xE0),
+                0xFFFF => self
+                    .interrupt_handler
+                    .as_ref()
+                    .map_or(0, |handler| handler.ie_register),
                 _ => 0,
             }
         }
@@ -184,55 +214,38 @@ impl IoHandler for GameBoyIoWrapper {
     fn write_io(&mut self, address: u16, value: u8, interrupt_flags: &mut u8) {
         unsafe {
             match address {
-                0xFF00 => {
-                    if !self.joypad.is_null() {
-                        let joypad = self.joypad as *mut Joypad;
-                        (*joypad).write_register(value);
-                        log_ff00_write(
-                            value,
-                            (*joypad).read_register(),
-                            (*joypad).select,
-                            (*joypad).action_keys,
-                            (*joypad).direction_keys,
-                        );
-                    }
-                }
-                0xFF04..=0xFF07 => {
-                    if !self.timer.is_null() {
-                        let timer = self.timer as *mut Timer;
-                        (*timer).write_register(address, value, interrupt_flags);
-                    }
-                }
-                0xFF10..=0xFF3F => {
-                    if !self.apu.is_null() {
-                        let apu = self.apu as *mut Apu;
-                        (*apu).write_register(address, value);
-                    }
-                }
-                0xFF40..=0xFF4B => {
-                    if !self.ppu.is_null() {
-                        let ppu = self.ppu as *mut Ppu;
-                        (*ppu).write_register(address, value, interrupt_flags);
-                    }
-                }
-                0xFF0F => {
-                    if !self.interrupt_handler.is_null() {
-                        let handler = self.interrupt_handler as *mut InterruptHandler;
-                        (*handler).if_register = value | 0xE0;
-                    }
-                }
-                0xFFFF => {
-                    if !self.interrupt_handler.is_null() {
-                        let handler = self.interrupt_handler as *mut InterruptHandler;
-                        (*handler).ie_register = value;
-                    }
-                }
+                0xFF00 => write_if_present(self.joypad, |joypad| {
+                    joypad.write_register(value);
+                    log_ff00_write(
+                        value,
+                        joypad.read_register(),
+                        joypad.select,
+                        joypad.action_keys,
+                        joypad.direction_keys,
+                    );
+                }),
+                0xFF04..=0xFF07 => write_if_present(self.timer, |timer| {
+                    timer.write_register(address, value, interrupt_flags);
+                }),
+                0xFF10..=0xFF3F => write_if_present(self.apu, |apu| {
+                    apu.write_register(address, value);
+                }),
+                0xFF40..=0xFF4B => write_if_present(self.ppu, |ppu| {
+                    ppu.write_register(address, value, interrupt_flags);
+                }),
+                0xFF0F => write_if_present(self.interrupt_handler, |handler| {
+                    handler.if_register = value | 0xE0;
+                }),
+                0xFFFF => write_if_present(self.interrupt_handler, |handler| {
+                    handler.ie_register = value;
+                }),
                 _ => {}
             }
         }
     }
 }
 
+#[derive(Debug)]
 pub struct GameBoy {
     pub cpu: Cpu,
     pub mmu: Mmu,
@@ -365,24 +378,229 @@ impl GameBoy {
         // 1. 將按鍵等外部觸發的中斷標記匯入 MMU
         self.consume_external_interrupts();
 
-        // 2. 執行一次 CPU 指令
-        let cycles = self.cpu.step(&mut self.mmu);
+        // 2. 16-bit INC/DEC 會在 IDU 內部把暫存器值直接放到位址匯流排；
+        //    若值落在 OAM 範圍且 PPU 正在 mode 2，會觸發 OAM corruption bug。
+        if let Some(value) = self.peek_inc_dec_rr()
+            && (0xFE00..=0xFEFF).contains(&value)
+        {
+            let mut if_reg = self.mmu.read_byte(0xFF0F);
+            let delay = 4u32;
+            self.tick_components(delay, &mut if_reg);
+            self.write_if(if_reg);
 
-        // 3. 取得執行後的 IF
-        let mut if_reg = self.mmu.read_byte(0xFF0F);
+            if let Some(row) = self.ppu.oam_row {
+                self.mmu.oam_write_corruption(row);
+            }
 
-        // 4. 更新組件
-        for _cycle in 0..cycles {
-            self.ppu.tick(&self.mmu, &mut if_reg);
-            self.timer.tick(&mut if_reg);
-            self.apu.tick();
+            let cycles = self.cpu.step(&mut self.mmu);
+            let mut if_reg = self.mmu.read_byte(0xFF0F);
+            self.tick_components(cycles.saturating_sub(delay), &mut if_reg);
+            self.write_if(if_reg);
+            return cycles;
         }
 
-        // 5. 寫回 MMU
-        self.mmu.write_byte(0xFF0F, if_reg);
-        self.mmu.if_reg = if_reg;
+        // 3. POP/PUSH/LD A,(HL±) 在指令內部有多個 OAM 匯流排事件，
+        //    依硬體 cycle 逐一觸發（read/write corruption）。
+        let oam_events = self.oam_events_for_next_instruction();
+        if !oam_events.is_empty() {
+            let mut if_reg = self.mmu.read_byte(0xFF0F);
+            let mut consumed = 0u32;
+            for (offset, event) in &oam_events {
+                let target = (*offset).min(16);
+                if target > consumed {
+                    self.tick_components(target - consumed, &mut if_reg);
+                    consumed = target;
+                    self.write_if(if_reg);
+                }
+
+                if let Some(row) = self.ppu.oam_row {
+                    match *event {
+                        OamBusEvent::Read(address) if (0xFE00..=0xFEFF).contains(&address) => {
+                            self.mmu.oam_read_corruption(row);
+                        }
+                        OamBusEvent::Write(address) if (0xFE00..=0xFEFF).contains(&address) => {
+                            self.mmu.oam_write_corruption(row);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let cycles = self.cpu.step(&mut self.mmu);
+            let mut if_reg = self.mmu.read_byte(0xFF0F);
+            self.tick_components(cycles.saturating_sub(consumed), &mut if_reg);
+            self.write_if(if_reg);
+            return cycles;
+        }
+
+        // 3. 先看這一條指令會在匯流排上做幾次資料存取。
+        //    CPU 是一個指令執行完才一次讀寫，所以要在執行前先把週期補到
+        //    存取發生的位置，讀寫才會落在硬體正確的 cycle 上。
+        let Some((instruction_cycles, bus_accesses)) = self.instruction_bus_profile() else {
+            // 沒有資料存取（或中斷/ halted）：維持原本「執行完整條指令後再一次補週期」。
+            let cycles = self.cpu.step(&mut self.mmu);
+            let mut if_reg = self.mmu.read_byte(0xFF0F);
+            self.tick_components(cycles, &mut if_reg);
+            self.write_if(if_reg);
+            return cycles;
+        };
+
+        let mut if_reg = self.mmu.read_byte(0xFF0F);
+        let mut consumed_cycles = 0;
+
+        // 單一讀寫：存取在最後一個 cycle（最後一個 T-cycle），先補 cycles-1。
+        // 讀-改-寫：讀在倒數第二個 cycle、寫在最後一個 cycle；兩者相差一個
+        // M-cycle (4 T-cycles)，所以先補 cycles-5，讀完再隔 4 個 T-cycle 才寫入。
+        let (pre_ticks, gap_ticks) = if bus_accesses == 2 {
+            (instruction_cycles.saturating_sub(5), 4)
+        } else {
+            (instruction_cycles.saturating_sub(1), 1)
+        };
+        if pre_ticks > 0 {
+            self.tick_components(pre_ticks, &mut if_reg);
+            consumed_cycles += pre_ticks;
+            // 讓 cpu.step() 看到補完週期後的中斷狀態
+            self.write_if(if_reg);
+        }
+
+        if bus_accesses == 2 {
+            self.mmu.capture_writes = true;
+        }
+        let cycles = self.cpu.step(&mut self.mmu);
+        if bus_accesses == 2 {
+            self.mmu.capture_writes = false;
+        }
+
+        let mut if_reg = self.mmu.read_byte(0xFF0F);
+
+        if bus_accesses == 2 {
+            if consumed_cycles < cycles {
+                // 讀完之後、寫入之前隔一個 M-cycle：寫入落在最後一個 cycle
+                let gap = gap_ticks.min(cycles - consumed_cycles);
+                self.tick_components(gap, &mut if_reg);
+                consumed_cycles += gap;
+            }
+
+            let writes = std::mem::take(&mut self.mmu.captured_writes);
+            for (address, value) in writes {
+                self.mmu.write_byte(address, value);
+            }
+        }
+
+        let remaining = cycles.saturating_sub(consumed_cycles);
+        self.tick_components(remaining, &mut if_reg);
+        self.write_if(if_reg);
 
         cycles
+    }
+
+    // 補週期：PPU / Timer / APU 每個 T-cycle 各 tick 一次
+    fn tick_components(&mut self, cycles: u32, if_reg: &mut u8) {
+        for _cycle in 0..cycles {
+            self.ppu.tick(&self.mmu, if_reg);
+            self.timer.tick(if_reg);
+            self.apu.tick();
+        }
+    }
+
+    fn write_if(&mut self, if_reg: u8) {
+        self.mmu.write_byte(0xFF0F, if_reg);
+        self.mmu.if_reg = if_reg;
+    }
+
+    /// 下一條指令若是 16-bit INC/DEC（BC/DE/HL/SP），回傳操作前的暫存器值。
+    fn peek_inc_dec_rr(&self) -> Option<u16> {
+        if self.cpu.state == CpuState::Halted {
+            return None;
+        }
+        if self.cpu.ime == InterruptMasterState::Enabled
+            && (self.mmu.ie & self.mmu.if_reg & 0x1F) != 0
+        {
+            return None;
+        }
+
+        let opcode = self.mmu.read_byte_ppu(self.cpu.pc);
+        match opcode {
+            0x03 | 0x0B => Some(self.cpu.get_bc()),
+            0x13 | 0x1B => Some(self.cpu.get_de()),
+            0x23 | 0x2B => Some(self.cpu.get_hl()),
+            0x33 | 0x3B => Some(self.cpu.sp),
+            _ => None,
+        }
+    }
+
+    /// POP/PUSH/LD A,(HL±) 這一類指令內部會產生多個 OAM 匯流排事件。
+    /// 回傳 (T-cycle 偏移, 事件) 的清單，供呼叫端在正確時點觸發 corruption。
+    fn oam_events_for_next_instruction(&self) -> Vec<(u32, OamBusEvent)> {
+        if self.cpu.state == CpuState::Halted {
+            return Vec::new();
+        }
+        if self.cpu.ime == InterruptMasterState::Enabled
+            && (self.mmu.ie & self.mmu.if_reg & 0x1F) != 0
+        {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+        let opcode = self.mmu.read_byte_ppu(self.cpu.pc);
+        match opcode {
+            // POP rr：M2/M3 各讀一次，讀取的位址也在 $FE00-$FEFF 時觸發
+            // read corruption（POP 的兩次 SP 增量即表現在這兩個位址上）。
+            0xC1 | 0xD1 | 0xE1 | 0xF1 => {
+                let sp = self.cpu.sp;
+                events.push((4, OamBusEvent::Read(sp)));
+                events.push((8, OamBusEvent::Read(sp.wrapping_add(1))));
+            }
+            // PUSH rr：SP 的兩次遞減在 M2/M3/M4 三個 cycle 都會把值放上
+            // 位址匯流排，各觸發一次 write corruption。觸發條件看的是遞減前
+            // 的 SP（$FE00 仍會觸發，即使實際寫入位址已是 $FDFF）。
+            0xC5 | 0xD5 | 0xE5 | 0xF5 => {
+                let sp = self.cpu.sp;
+                events.push((4, OamBusEvent::Write(sp)));
+                events.push((8, OamBusEvent::Write(sp)));
+                events.push((12, OamBusEvent::Write(sp)));
+            }
+            // LD A,(HL+) / LD A,(HL-)：M2 讀取時 HL 增量驅動位址匯流排
+            0x2A | 0x3A => {
+                let hl = self.cpu.get_hl();
+                events.push((4, OamBusEvent::Read(hl)));
+            }
+            _ => {}
+        }
+        events
+    }
+
+    /// 回傳 (指令總 cycle 數, 資料匯流排存取次數)。
+    ///
+    /// 只處理「會在最後兩個 cycle 存取記憶體」的指令；中斷分派、HALT 與
+    /// push/pop/call/ret 等堆疊指令不在這裡處理（堆疊存取不列入 mem_timing）。
+    fn instruction_bus_profile(&self) -> Option<(u32, u32)> {
+        if self.cpu.state == CpuState::Halted {
+            return None;
+        }
+        if self.cpu.ime == InterruptMasterState::Enabled
+            && (self.mmu.ie & self.mmu.if_reg & 0x1F) != 0
+        {
+            // 這一條會變成中斷分派，不要預先補週期
+            return None;
+        }
+
+        let pc = self.cpu.pc;
+        let first = self.mmu.read_byte_ppu(pc);
+        let opcode = if first == 0xCB {
+            let second = self.mmu.read_byte_ppu(pc.wrapping_add(1));
+            OPCODES.cbprefixed[second as usize].as_ref()?
+        } else {
+            OPCODES.unprefixed[first as usize].as_ref()?
+        };
+
+        let accesses = bus_accesses(opcode);
+        if accesses == 0 {
+            return None;
+        }
+
+        let cycles = u32::from(*opcode.cycles.first()?);
+        Some((cycles, accesses))
     }
 
     // 獲取當前畫面緩衝區

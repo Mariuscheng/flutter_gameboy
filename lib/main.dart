@@ -193,16 +193,14 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
 
       final emulator = _shouldReadRomBytes
           ? await GameBoyEmulator.newInstance(romBytes: bytes!)
-          : await RustLib.instance.api.crateApiGameBoyEmulatorNewFromPath(
-              path: path!,
-            );
+          : await GameBoyEmulator.newFromPath(path: path!);
 
       if (!mounted || session != _emulatorSession) {
         return;
       }
 
       _emulator = emulator;
-      _ticker = createTicker((elapsed) {
+      final ticker = createTicker((elapsed) {
         if (session != _emulatorSession) {
           return;
         }
@@ -223,14 +221,16 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
           _emulatorFrameMicros * _maxCatchUpFrames,
         );
         unawaited(_renderNextFrame(session));
-      })..start();
+      });
+      _ticker = ticker;
+      unawaited(ticker.start());
 
       setState(() {
         _loadingRom = false;
         _status = 'ROM 已載入：${selectedFile.name}';
       });
       _requestInputFocus();
-    } catch (error) {
+    } on Object catch (error) {
       setState(() {
         _loadingRom = false;
         _status = '載入失敗：$error';
@@ -240,7 +240,9 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
   }
 
   Future<void> _renderNextFrame(int session) async {
-    if (_isRendering) return;
+    if (_isRendering) {
+      return;
+    }
     _isRendering = true;
 
     try {
@@ -309,7 +311,7 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
       final previous = _frameImageNotifier.value;
       _frameImageNotifier.value = image;
       previous?.dispose();
-    } catch (error) {
+    } on Object catch (error) {
       _ticker?.stop();
       if (!mounted) {
         return;
@@ -548,7 +550,6 @@ class _GameBoyHomePageState extends State<GameBoyHomePage>
                           const SizedBox(height: 24),
                           Row(
                             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                            crossAxisAlignment: CrossAxisAlignment.center,
                             children: [_buildDPad(), _buildActionButtons()],
                           ),
                           const SizedBox(height: 32),

@@ -39,6 +39,35 @@ pub struct Mmu {
 
     // 供 CPU-side VRAM/OAM 存取限制使用（PPU 內部讀取不受限）
     ppu: Option<*mut Ppu>,
+
+    // 讀-改-寫指令的寫入會延後到硬體正確的 cycle 才真正套用
+    pub capture_writes: bool,
+    pub captured_writes: Vec<(u16, u8)>,
+}
+
+impl std::fmt::Debug for Mmu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 大型緩衝區只輸出長度，避免 Debug 輸出被幾十 KB 的內容淹沒；
+        // `io_handler` 是 trait object，沒有 Debug 可比。
+        f.debug_struct("Mmu")
+            .field("rom_len", &self.rom.len())
+            .field("wram_len", &self.wram.len())
+            .field("ext_ram_len", &self.ext_ram.len())
+            .field("vram_len", &self.vram.len())
+            .field("oam_len", &self.oam.len())
+            .field("hram_len", &self.hram.len())
+            .field("ie", &self.ie)
+            .field("if_reg", &self.if_reg)
+            .field("serial_data", &self.serial_data)
+            .field("serial_control", &self.serial_control)
+            .field("serial_output", &self.serial_output)
+            .field("mbc_type", &self.mbc_type)
+            .field("rom_bank", &self.rom_bank)
+            .field("ram_bank", &self.ram_bank)
+            .field("ram_state", &self.ram_state)
+            .field("banking_mode", &self.banking_mode)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Mmu {
@@ -64,6 +93,8 @@ impl Mmu {
 
             io_handler: None,
             ppu: None,
+            capture_writes: false,
+            captured_writes: Vec::new(),
         }
     }
 
@@ -153,6 +184,12 @@ impl Mmu {
     }
 
     pub fn write_byte(&mut self, address: u16, value: u8) {
+        // 讀-改-寫指令：寫入先記錄下來，等 CPU 走到硬體正確的 cycle 再套用
+        if self.capture_writes {
+            self.captured_writes.push((address, value));
+            return;
+        }
+
         // CPU-side VRAM/OAM 存取限制（同 read_byte 的規則）
         if let Some(ppu_ptr) = self.ppu {
             unsafe {
@@ -282,12 +319,126 @@ impl Mmu {
         ((high as u16) << 8) | (low as u16)
     }
 
+    /// DMG OAM corruption bug 的 write corruption。
+    ///
+    /// `row` 是 PPU 目前在 mode 2 讀取的 OAM row（byte offset，8 的倍數）。
+    /// 會把該 row 的第一個 word 換成 `((a ^ c) & (b ^ c)) ^ c`，並把前一個
+    /// row 的後三個 word 複製過來（objects 0/1 那一 row 不受影響）。
+    pub fn oam_write_corruption(&mut self, row: u16) {
+        let row = row as usize;
+        if !(8..=152).contains(&row) {
+            return;
+        }
+
+        let word = |offset: usize| u16::from_le_bytes([self.oam[offset], self.oam[offset + 1]]);
+        let a = word(row);
+        let b = word(row - 8);
+        let c = word(row - 4);
+        let glitched = ((a ^ c) & (b ^ c)) ^ c;
+
+        self.oam[row..row + 2].copy_from_slice(&glitched.to_le_bytes());
+        for offset in 2..8 {
+            self.oam[row + offset] = self.oam[row - 8 + offset];
+        }
+    }
+
     // 寫入字組 (little-endian)
     pub fn write_word(&mut self, address: u16, value: u16) {
         let low = (value & 0xFF) as u8;
         let high = ((value >> 8) & 0xFF) as u8;
         self.write_byte(address, low);
         self.write_byte(address + 1, high);
+    }
+
+    /// DMG OAM corruption bug 的 read corruption。
+    ///
+    /// 讀取 `$FE00-$FEFF` 時位址匯流排與 PPU 的 OAM 掃描衝突，會依 PPU
+    /// 目前的 OAM row（`row & $18`）套用不同的位元運算，並把前一 row 的
+    /// 內容複製過來。公式與 SameBoy 的 DMG 模型一致。
+    pub fn oam_read_corruption(&mut self, row: u16) {
+        let row = row as usize;
+        if !(8..=152).contains(&row) {
+            return;
+        }
+
+        let mut oam = self.oam.clone();
+        let word = |offset: usize| u16::from_le_bytes([oam[offset], oam[offset + 1]]);
+        let write_word = |oam: &mut [u8], offset: usize, value: u16| {
+            oam[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        };
+
+        match row & 0x18 {
+            // row 0x10/0x30/...：secondary 版本
+            0x10 => {
+                let value = (word(row - 8) & (word(row - 16) | word(row) | word(row - 4)))
+                    | (word(row - 16) & word(row) & word(row - 4));
+                write_word(&mut oam, row - 8, value);
+                for offset in 0..8 {
+                    oam[row - 16 + offset] = oam[row - 8 + offset];
+                }
+            }
+            // row 0x00/0x20/...：tertiary/quaternary 版本
+            0x00 => {
+                let value = if row == 0x40 {
+                    // quaternary（DMG 會輸出 0 的那一版，第一個參數不影響結果）
+                    let b = word(row);
+                    let c = word(row - 4);
+                    let d = word(row - 6);
+                    let e = word(row - 8);
+                    let f = word(row - 14);
+                    let g = word(row - 16);
+                    let h = word(row - 32);
+                    (e & (h | g | (!d & f) | c | b)) | (c & g & h)
+                } else if row == 0x20 {
+                    // tertiary 2
+                    let a = word(row);
+                    let b = word(row - 4);
+                    let c = word(row - 8);
+                    let d = word(row - 16);
+                    let e = word(row - 32);
+                    (c & (a | b | d | e)) | (a & b & d & e)
+                } else if row == 0x60 {
+                    // tertiary 3
+                    let a = word(row);
+                    let b = word(row - 4);
+                    let c = word(row - 8);
+                    let d = word(row - 16);
+                    let e = word(row - 32);
+                    (c & (a | b | d | e)) | (b & d & e)
+                } else {
+                    // tertiary 1
+                    let a = word(row);
+                    let b = word(row - 4);
+                    let c = word(row - 8);
+                    let d = word(row - 16);
+                    let e = word(row - 32);
+                    c | (a & b & d & e)
+                };
+                write_word(&mut oam, row - 8, value);
+                for offset in 0..8 {
+                    let source = oam[row - 8 + offset];
+                    oam[row - 16 + offset] = source;
+                    oam[row - 32 + offset] = source;
+                }
+            }
+            // row 0x08/0x28/...：簡單版本
+            _ => {
+                let value = word(row - 8) | (word(row) & word(row - 4));
+                write_word(&mut oam, row - 8, value);
+                write_word(&mut oam, row, value);
+            }
+        }
+
+        for offset in 0..8 {
+            oam[row + offset] = oam[row - 8 + offset];
+        }
+        if row == 0x80 {
+            for offset in 0..8 {
+                oam[offset] = oam[0x80 + offset];
+            }
+        }
+
+        self.oam = oam;
     }
 
     // 載入 ROM 資料
@@ -333,10 +484,10 @@ impl Mmu {
     }
 
     pub fn save_external_ram(&self) {
-        if !self.ext_ram.is_empty() {
-            if let Err(e) = std::fs::write("save.sav", &self.ext_ram) {
-                eprintln!("存檔失敗: {}", e);
-            }
+        if !self.ext_ram.is_empty()
+            && let Err(e) = std::fs::write("save.sav", &self.ext_ram)
+        {
+            eprintln!("存檔失敗: {}", e);
         }
     }
 

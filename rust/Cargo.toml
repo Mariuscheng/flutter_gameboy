@@ -8,12 +8,10 @@ name = "rust_lib_flutter_gameboy"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-crossbeam = "0.8.4"
 serde_json = "1.0.149"
 serde = { version = "1.0.228", features = ["derive"] }
 flutter_rust_bridge = "=2.12.0"
 cpal = "0.17.3"
-crossbeam-channel = "0.5.15"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21.1"
@@ -23,6 +21,11 @@ ndk-context = "0.1.1"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(lazy_lock)'] }
 unsafe_op_in_unsafe_fn = "warn"
 missing_debug_implementations = "warn"
+
+[lints.clippy]
+# 防止 AI 留下除錯輸出或未完成的佔位符（只在 cargo clippy 時生效）。
+dbg_macro = "deny"
+todo = "deny"
 
 [profile.release]
 opt-level = 3

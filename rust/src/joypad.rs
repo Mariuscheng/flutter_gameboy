@@ -3,7 +3,7 @@
 use crate::gameboy::InterruptHandler;
 use std::time::{Duration, Instant};
 
-#[allow(missing_debug_implementations)]
+#[derive(Debug)]
 pub struct Joypad {
     // 按鍵狀態 (0 代表按下，1 代表放開)
     // 位元: 0=A/右, 1=B/左, 2=Select/上, 3=Start/下
@@ -52,6 +52,12 @@ impl Default for DebounceFilter {
             debounce_threshold: Duration::from_millis(5), // 5ms 去抖動
             bounce_events_filtered: 0,
         }
+    }
+}
+
+impl Default for Joypad {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

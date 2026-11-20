@@ -1,5 +1,6 @@
 // Timer (計時器) - 負責處理 Game Boy 的定時中斷
 
+#[derive(Debug)]
 pub struct Timer {
     pub div: u16, // 內部分頻器 (高 8 位元即為 0xFF04 的 DIV 寄存器)
     pub tima: u8, // 0xFF05 - Timer Counter

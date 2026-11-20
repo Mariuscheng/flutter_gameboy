@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 // APU (Audio Processing Unit) - Game Boy 音訊處理器
+#[derive(Debug)]
 pub struct Apu {
     // 方波通道 A (Pulse A) - 0xFF10-0xFF14
     pulse_a: PulseChannel,
@@ -22,6 +23,9 @@ pub struct Apu {
     // 音訊緩衝區
     pub audio_buffer: VecDeque<f32>,
     sample_counter: u32,
+
+    // 全域 APU 週期計數器 (T-cycle)，供需要絕對時間的通道使用
+    cycle_count: u64,
 }
 
 // 使用整數算術避免浮點數漂移
@@ -45,6 +49,7 @@ impl Apu {
             frame_sequencer: FrameSequencer::new(),
             audio_buffer: VecDeque::with_capacity(8192),
             sample_counter: 0,
+            cycle_count: 0,
         }
     }
 
@@ -159,7 +164,9 @@ impl Apu {
             0xFF1B => self.wave.write_nr31(value),
             0xFF1C => self.wave.write_nr32(value),
             0xFF1D => self.wave.write_nr33(value),
-            0xFF1E => self.wave.write_nr34(value, self.frame_sequencer.step),
+            0xFF1E => self
+                .wave
+                .write_nr34(value, self.frame_sequencer.step, self.cycle_count),
 
             0xFF1F => {} // NR40 不存在
             0xFF20 => self.noise.write_nr41(value),
@@ -190,6 +197,8 @@ impl Apu {
 
     // 更新 APU 狀態 (每 T-cycle 調用)
     pub fn tick(&mut self) {
+        self.cycle_count = self.cycle_count.wrapping_add(1);
+
         if !self.is_enabled() {
             return;
         }
@@ -227,7 +236,7 @@ impl Apu {
         // 頻率計時器
         self.pulse_a.tick();
         self.pulse_b.tick();
-        self.wave.tick();
+        self.wave.tick(self.cycle_count);
         self.noise.tick();
 
         // 採樣 - 使用整數算術避免漂移
@@ -313,6 +322,7 @@ impl Apu {
 }
 
 // 幀序列器 - 512Hz 時鐘
+#[derive(Debug)]
 struct FrameSequencer {
     timer: u16,
     step: u8,
@@ -348,6 +358,7 @@ impl FrameSequencer {
 }
 
 // 方波通道
+#[derive(Debug)]
 struct PulseChannel {
     enabled: bool,
     dac_enabled: bool,
@@ -663,18 +674,21 @@ impl PulseChannel {
 }
 
 // 波形通道
+#[derive(Debug)]
 struct WaveChannel {
     enabled: bool,
     dac_enabled: bool,
 
     frequency: u16,
-    frequency_timer: u16,
 
     length_counter: u16,
     length_enabled: bool,
 
     volume_code: u8,
+
+    // 最近一次讀取的樣本索引 (0-31)，以及下一次讀取 wave RAM 的絕對週期
     position: u8,
+    next_read_cycle: Option<u64>,
 
     wave_ram: [u8; 16],
     sample_buffer: u8,
@@ -693,11 +707,11 @@ impl WaveChannel {
             enabled: false,
             dac_enabled: false,
             frequency: 0,
-            frequency_timer: 0,
             length_counter: 0,
             length_enabled: false,
             volume_code: 0,
             position: 0,
+            next_read_cycle: None,
             wave_ram: [0; 16],
             sample_buffer: 0,
             just_accessed_wave_ram: false,
@@ -711,12 +725,20 @@ impl WaveChannel {
         self.enabled
     }
 
+    // 波形通道每個樣本的長度：2 * (2048 - 頻率) T-cycles
+    fn period(&self) -> u64 {
+        ((2048 - self.frequency) * 2) as u64
+    }
+
     fn power_off(&mut self) {
         self.enabled = false;
         self.dac_enabled = false;
         self.frequency = 0;
         self.length_enabled = false;
         self.volume_code = 0;
+        self.position = 0;
+        self.next_read_cycle = None;
+        self.just_accessed_wave_ram = false;
         self.nr30 = 0;
         self.nr32 = 0;
     }
@@ -754,7 +776,7 @@ impl WaveChannel {
         self.frequency = (self.frequency & 0x0700) | value as u16;
     }
 
-    fn write_nr34(&mut self, value: u8, frame_step: u8) {
+    fn write_nr34(&mut self, value: u8, frame_step: u8, cycle: u64) {
         self.frequency = (self.frequency & 0x00FF) | ((value as u16 & 0x07) << 8);
 
         let prev_length_enabled = self.length_enabled;
@@ -771,23 +793,43 @@ impl WaveChannel {
             }
         }
 
+        // 觸發（bit 7）時，即使 DAC 關閉，長度計數器等其他效果仍會發生；
+        // 只有「實際開始播放」與 Wave RAM 損毀需要 DAC 開啟。
         if (value & 0x80) != 0 {
-            self.trigger(frame_step);
+            self.trigger(frame_step, cycle);
         }
     }
 
-    fn trigger(&mut self, frame_step: u8) {
-        // DMG Wave 通道 corruption bug:
-        // 當 Wave 通道正在播放時被重新觸發，Wave RAM 可能會損壞
-        // 這個 bug 需要非常精確的 T-cycle 級別時序才能正確實現
-        // 許多模擬器選擇不實現這個 bug，因為它很少影響實際遊戲
-        // 只有 Duck Tales 等少數遊戲會觸發這個問題
+    fn trigger(&mut self, frame_step: u8, cycle: u64) {
+        // DMG 特有的 Wave RAM 損毀 bug：
+        // 若通道正在播放，且在它「即將讀取樣本」的那個時脈被重新觸發，
+        // 硬體會把內部正在讀取的 4-byte 區塊寫回 Wave RAM 的前四個位元組。
+        // 條件與內容依照 gambatte / Pan Docs 的描述（本模擬器目前只有 DMG 模式）：
+        //   - 讀取位置 < 4：只把 wave_ram[0] 蓋成該位置的值
+        //   - 讀取位置 >= 4：把對齊的 4-byte 區塊複製到 wave_ram[0..4]
+        // APU 內部時脈是 2MHz，讀取窗口只有 1 個內部時脈，換算成 T-cycle
+        // 就是「下一次讀取剛好落在 2 個 T-cycle 之後」。
+        if self.enabled && self.next_read_cycle == Some(cycle + 2) {
+            let byte_index = (((self.position + 1) & 0x1F) >> 1) as usize;
+            if byte_index < 4 {
+                self.wave_ram[0] = self.wave_ram[byte_index];
+            } else {
+                let source = byte_index & !3;
+                let block = [
+                    self.wave_ram[source],
+                    self.wave_ram[source + 1],
+                    self.wave_ram[source + 2],
+                    self.wave_ram[source + 3],
+                ];
+                self.wave_ram[0..4].copy_from_slice(&block);
+            }
+        }
 
         // 波形通道觸發時重新啟用
         self.enabled = self.dac_enabled;
 
-        // 頻率計時器重新載入（有額外延遲）
-        self.frequency_timer = (2048 - self.frequency) * 2 + 6;
+        // 下一次讀取：觸發後延遲 3 個 2MHz 週期 (6 T-cycles) 再加上一個樣本週期
+        self.next_read_cycle = Some(cycle.wrapping_add(self.period() + 6));
 
         if self.length_counter == 0 {
             self.length_counter = 256;
@@ -796,35 +838,37 @@ impl WaveChannel {
             }
         }
 
-        // 位置重置為 0
+        // 取樣位置歸零，但 sample_buffer 不會在觸發時更新（硬體行為）：
+        // 觸發後會先重播上一個殘留的樣本，等第一次讀取才載入新的 nibble。
         self.position = 0;
-        // 重新讀取第一個樣本
-        self.sample_buffer = self.wave_ram[0] >> 4;
     }
 
-    fn tick(&mut self) {
+    fn tick(&mut self, cycle: u64) {
         // 清除 Wave RAM 存取標記
         self.just_accessed_wave_ram = false;
 
-        if self.frequency_timer > 0 {
-            self.frequency_timer -= 1;
+        let Some(next_read) = self.next_read_cycle else {
+            return;
+        };
+        if cycle < next_read {
+            return;
         }
 
-        if self.frequency_timer == 0 {
-            self.frequency_timer = (2048 - self.frequency) * 2;
-            self.position = (self.position + 1) & 31;
+        // 正常情況下 tick() 每個 T-cycle 都會被呼叫，因此最多只會有一次讀取。
+        // 這裡用算術一次跳到最新樣本，避免計數器落後時一次補上大量讀取。
+        let period = self.period();
+        let reads = (cycle - next_read) / period + 1;
 
-            let byte_index = (self.position / 2) as usize;
-            self.last_wave_ram_byte = self.wave_ram[byte_index];
-            self.just_accessed_wave_ram = true;
+        self.position = ((u64::from(self.position) + reads) & 31) as u8;
+        self.next_read_cycle = Some(next_read + reads * period);
 
-            let nibble = if self.position & 1 == 0 {
-                self.last_wave_ram_byte >> 4
-            } else {
-                self.last_wave_ram_byte & 0x0F
-            };
-            self.sample_buffer = nibble;
-        }
+        self.last_wave_ram_byte = self.wave_ram[(self.position / 2) as usize];
+        self.just_accessed_wave_ram = true;
+        self.sample_buffer = if self.position & 1 == 0 {
+            self.last_wave_ram_byte >> 4
+        } else {
+            self.last_wave_ram_byte & 0x0F
+        };
     }
 
     fn clock_length(&mut self) {
@@ -882,6 +926,7 @@ impl WaveChannel {
 }
 
 // 噪音通道
+#[derive(Debug)]
 struct NoiseChannel {
     enabled: bool,
     dac_enabled: bool,
@@ -1095,5 +1140,95 @@ impl NoiseChannel {
         };
 
         (dac_input as f32 / 7.5) - 1.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Apu;
+
+    // 建立已開啟 APU、Wave DAC 的 Apu，並把 Wave RAM 填入 00 11 22 ... FF
+    fn apu_with_wave_pattern() -> Apu {
+        let mut apu = Apu::new();
+        apu.write_register(0xFF26, 0x80); // 開啟 APU
+        apu.write_register(0xFF1A, 0x80); // 開啟 Wave DAC
+        for i in 0..16u16 {
+            apu.write_register(0xFF30 + i, (i as u8) * 0x11);
+        }
+        apu
+    }
+
+    // DMG 的 Wave RAM 損毀 bug：在通道即將讀取樣本時重新觸發，
+    // 會把該次讀取所在的 4-byte 對齊區塊複製到 Wave RAM 前四個位元組。
+    #[test]
+    fn wave_retrigger_while_reading_copies_aligned_block() {
+        let mut apu = apu_with_wave_pattern();
+        apu.wave.enabled = true;
+        apu.wave.position = 8; // 下一次讀取會落在 byte 4，對齊區塊為 4-7
+        apu.cycle_count = 1000;
+        apu.wave.next_read_cycle = Some(1002);
+
+        apu.write_register(0xFF1E, 0x87); // 觸發
+
+        assert_eq!(&apu.wave.wave_ram[0..4], &[0x44, 0x55, 0x66, 0x77]);
+        assert_eq!(&apu.wave.wave_ram[4..8], &[0x44, 0x55, 0x66, 0x77]);
+        assert_eq!(apu.wave.wave_ram[15], 0xFF);
+    }
+
+    // 若讀取位置在前四個 byte，只會把第一個 byte 蓋成該位置的值。
+    #[test]
+    fn wave_retrigger_while_reading_first_block_copies_single_byte() {
+        let mut apu = apu_with_wave_pattern();
+        apu.wave.enabled = true;
+        apu.wave.position = 2; // 下一次讀取為 byte 1
+        apu.cycle_count = 1000;
+        apu.wave.next_read_cycle = Some(1002);
+
+        apu.write_register(0xFF1E, 0x87); // 觸發
+
+        assert_eq!(&apu.wave.wave_ram[0..4], &[0x11, 0x11, 0x22, 0x33]);
+    }
+
+    // 觸發時若不在讀取窗口內，Wave RAM 不應該改變。
+    #[test]
+    fn wave_retrigger_while_on_does_not_always_corrupt_wave_ram() {
+        let mut apu = apu_with_wave_pattern();
+        apu.wave.enabled = true;
+        apu.wave.position = 8;
+        apu.cycle_count = 1000;
+        apu.wave.next_read_cycle = Some(1010);
+
+        apu.write_register(0xFF1E, 0x87); // 觸發
+
+        assert_eq!(&apu.wave.wave_ram[0..4], &[0x00, 0x11, 0x22, 0x33]);
+    }
+
+    // 通道不在播放時重新觸發不應該造成損毀。
+    #[test]
+    fn wave_retrigger_while_disabled_does_not_corrupt_wave_ram() {
+        let mut apu = apu_with_wave_pattern();
+        apu.wave.enabled = false;
+        apu.wave.position = 8;
+        apu.cycle_count = 1000;
+        apu.wave.next_read_cycle = Some(1002);
+
+        apu.write_register(0xFF1E, 0x87); // 觸發
+
+        assert_eq!(&apu.wave.wave_ram[0..4], &[0x00, 0x11, 0x22, 0x33]);
+    }
+
+    // 觸發不會立刻刷新 sample buffer，會先重播上一個殘留的樣本。
+    #[test]
+    fn wave_trigger_keeps_previous_sample_buffer() {
+        let mut apu = apu_with_wave_pattern();
+        apu.wave.enabled = true;
+        apu.wave.sample_buffer = 0x0A;
+        apu.wave.position = 8;
+        apu.cycle_count = 1000;
+        apu.wave.next_read_cycle = Some(1010);
+
+        apu.write_register(0xFF1E, 0x87); // 觸發
+
+        assert_eq!(apu.wave.sample_buffer, 0x0A);
     }
 }
